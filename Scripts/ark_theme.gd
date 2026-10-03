@@ -57,6 +57,8 @@ static func build() -> Theme:
 	_style_scroll(theme)
 	_style_tips(theme)
 	_style_windows(theme)
+	_style_tree(theme)
+	_style_split(theme)
 	return theme
 
 
@@ -99,6 +101,20 @@ static func _style_buttons(theme: Theme) -> void:
 	theme.set_color("icon_hover_pressed_color", "CheckBox", GOLD)
 	theme.set_color("icon_focus_color", "CheckBox", FOAM)
 	theme.set_color("icon_disabled_color", "CheckBox", SEA)
+	theme.set_icon("checked", "CheckBox", check_icon(1))
+	theme.set_icon("unchecked", "CheckBox", check_icon(0))
+
+	theme.set_icon("checked", "CheckButton", toggle_icon(true))
+	theme.set_icon("unchecked", "CheckButton", toggle_icon(false))
+	var bare := _outline(Color(0, 0, 0, 0), Color(0, 0, 0, 0))
+	for state in ["normal", "hover", "pressed", "hover_pressed", "focus", "disabled"]:
+		theme.set_stylebox(state, "CheckButton", bare)
+	theme.set_color("font_color", "CheckButton", SEA)
+	theme.set_color("font_hover_color", "CheckButton", PARCHMENT)
+	theme.set_color("font_pressed_color", "CheckButton", GOLD)
+	theme.set_color("font_hover_pressed_color", "CheckButton", GOLD)
+	theme.set_color("font_focus_color", "CheckButton", PARCHMENT)
+	theme.set_font_size("font_size", "CheckButton", SIZE_SMALL)
 
 
 static func _style_inputs(theme: Theme) -> void:
@@ -186,6 +202,121 @@ static func _style_windows(theme: Theme) -> void:
 	theme.set_color("title_color", "Window", GOLD)
 	theme.set_constant("title_height", "Window", 28)
 	theme.set_stylebox("panel", "AcceptDialog", _outline(GOLD, INK))
+
+
+## The file table. One control draws every row, so a long item list needs no paging.
+static func _style_tree(theme: Theme) -> void:
+	theme.set_stylebox("panel", "Tree", _box(GOLD_DIM, INK, 2, 2, 1))
+	theme.set_stylebox("focus", "Tree", StyleBoxEmpty.new())
+	theme.set_stylebox("selected", "Tree", _box(HULL_RAISED, HULL_RAISED, 0, 0, 0))
+	theme.set_stylebox("selected_focus", "Tree", _box(HULL_RAISED, HULL_RAISED, 0, 0, 0))
+	theme.set_stylebox("hovered", "Tree", _box(HULL, HULL, 0, 0, 0))
+	theme.set_stylebox("hovered_dimmed", "Tree", _box(HULL, HULL, 0, 0, 0))
+	theme.set_stylebox("cursor", "Tree", StyleBoxEmpty.new())
+	theme.set_stylebox("cursor_unfocused", "Tree", StyleBoxEmpty.new())
+	var head := _box(GOLD_DIM, HULL, 8, 5, 0)
+	head.border_width_bottom = 1
+	theme.set_stylebox("title_button_normal", "Tree", head)
+	var head_hot := _box(GOLD, HULL_RAISED, 8, 5, 0)
+	head_hot.border_width_bottom = 1
+	theme.set_stylebox("title_button_hover", "Tree", head_hot)
+	theme.set_stylebox("title_button_pressed", "Tree", head_hot)
+	theme.set_color("title_button_color", "Tree", GOLD)
+	theme.set_font_size("title_button_font_size", "Tree", SIZE_SMALL)
+	theme.set_color("font_color", "Tree", PARCHMENT)
+	theme.set_color("font_selected_color", "Tree", FOAM)
+	theme.set_color("font_hovered_color", "Tree", FOAM)
+	theme.set_color("guide_color", "Tree", Color(GOLD_DIM, 0.25))
+	theme.set_constant("draw_guides", "Tree", 1)
+	theme.set_constant("v_separation", "Tree", 6)
+	theme.set_constant("h_separation", "Tree", 8)
+	theme.set_constant("inner_item_margin_left", "Tree", 6)
+	theme.set_constant("inner_item_margin_right", "Tree", 6)
+	theme.set_icon("checked", "Tree", check_icon(1))
+	theme.set_icon("unchecked", "Tree", check_icon(0))
+	theme.set_icon("indeterminate", "Tree", check_icon(2))
+	theme.set_icon("checked_disabled", "Tree", check_icon(1))
+	theme.set_icon("unchecked_disabled", "Tree", check_icon(0))
+	theme.set_icon("indeterminate_disabled", "Tree", check_icon(2))
+
+
+static func _style_split(theme: Theme) -> void:
+	for kind in ["HSplitContainer", "VSplitContainer", "SplitContainer"]:
+		theme.set_constant("separation", kind, 10)
+		theme.set_constant("minimum_grab_thickness", kind, 10)
+		theme.set_constant("autohide", kind, 0)
+	theme.set_icon("grabber", "HSplitContainer", grip_icon(false))
+	theme.set_icon("grabber", "VSplitContainer", grip_icon(true))
+	theme.set_icon("h_grabber", "SplitContainer", grip_icon(false))
+	theme.set_icon("v_grabber", "SplitContainer", grip_icon(true))
+
+
+## 0 clear, 1 ticked, 2 some. Square, like the rest of the chest.
+static func check_icon(state: int) -> ImageTexture:
+	var n := 16
+	var image := Image.create(n, n, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0, 0, 0, 0))
+	if state == 1:
+		image.fill_rect(Rect2i(0, 0, n, n), GOLD)
+		var tick := [
+			Vector2i(3, 8), Vector2i(4, 9), Vector2i(5, 10), Vector2i(6, 11),
+			Vector2i(7, 10), Vector2i(8, 9), Vector2i(9, 8), Vector2i(10, 7),
+			Vector2i(11, 6), Vector2i(12, 5),
+		]
+		for p in tick:
+			image.fill_rect(Rect2i(p.x, p.y - 1, 2, 2), INK)
+		return ImageTexture.create_from_image(image)
+	var edge := GOLD if state == 2 else SEA
+	image.fill_rect(Rect2i(0, 0, n, n), edge)
+	image.fill_rect(Rect2i(1, 1, n - 2, n - 2), INK)
+	if state == 2:
+		image.fill_rect(Rect2i(4, 7, n - 8, 2), GOLD)
+	return ImageTexture.create_from_image(image)
+
+
+static func toggle_icon(on: bool) -> ImageTexture:
+	var w := 30
+	var h := 16
+	var image := Image.create(w, h, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0, 0, 0, 0))
+	var edge := GOLD if on else SEA
+	image.fill_rect(Rect2i(0, 0, w, h), edge)
+	image.fill_rect(Rect2i(1, 1, w - 2, h - 2), INK)
+	var knob_x := w - 13 if on else 3
+	image.fill_rect(Rect2i(knob_x, 3, 10, h - 6), edge)
+	return ImageTexture.create_from_image(image)
+
+
+static func grip_icon(vertical: bool) -> ImageTexture:
+	var w := 16 if vertical else 4
+	var h := 4 if vertical else 16
+	var image := Image.create(w, h, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0, 0, 0, 0))
+	for i in 3:
+		var at := 2 + i * 5
+		if vertical:
+			image.fill_rect(Rect2i(at, 1, 2, 2), GOLD_DIM)
+		else:
+			image.fill_rect(Rect2i(1, at, 2, 2), GOLD_DIM)
+	return ImageTexture.create_from_image(image)
+
+
+## A small outlined tag: ABOARD, CACHED, COLLECTION.
+static func badge(text: String, colour: Color) -> Label:
+	var label := Label.new()
+	label.text = text
+	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	label.add_theme_font_size_override("font_size", 11)
+	label.add_theme_color_override("font_color", colour)
+	label.add_theme_stylebox_override("normal", _box(colour, Color(colour, 0.12), 5, 0, 1))
+	label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	label.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	return label
+
+
+## A flat surface for grouping inside a panel.
+static func well(fill: Color = INK, pad: int = 10) -> StyleBoxFlat:
+	return _box(fill, fill, pad, pad, 0)
 
 
 static func _outline(border: Color, fill: Color) -> StyleBoxFlat:

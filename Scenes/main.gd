@@ -1,12 +1,16 @@
 extends Control
 
-## ARCHIVE / STAGE / ABOARD. Search and OPEN work without a host.
-## Inscribe and Feature wait until GodOnChain is attached.
+## Two panes. BROWSE finds an item, on the Archive or already aboard.
+## ITEM picks its files and opens or inscribes them. Search and OPEN work
+## without a host. Inscribe and Feature wait until GodOnChain is attached.
 
 const CFG := "user://ark.cfg"
 const CHAINS := ["mon", "sol", "rh"]
-## Checkboxes built at once. The rest of a long file list stays one MORE away.
-const STAGE_PAGE := 40
+const CHAIN_NAMES := {"mon": "Monad", "sol": "Solana", "rh": "Robinhood"}
+const FILE_COL_NAME := 0
+const FILE_COL_FORMAT := 1
+const FILE_COL_SIZE := 2
+const FILE_COL_STATE := 3
 
 var chain := "mon"
 var cache := ArkCache.new()
@@ -15,7 +19,6 @@ var fetch: Fetch
 var busy := false
 var item: Dictionary = {}
 var docs: Array = []
-var boxes: Array = []
 var page := 1
 var mediatype := ""
 var sort_key := "downloads"
@@ -30,10 +33,13 @@ var _progress_note := ""
 var _stage_lock := false
 var stage_files: Array = []
 var picked := {}
-var stage_shown := 0
 var file_filter: LineEdit
+var file_type := ""
+var file_sort := "format"
+var file_sort_desc := false
+var _shown_files: Array = []
+var _filter_timer: Timer
 var stage_note: Label
-var stage_scroll: ScrollContainer
 var _thumb_token := 0
 var _thumb_inflight := 0
 var _thumb_queue: Array = []
@@ -42,15 +48,39 @@ var _thumbs := {}
 var host_label: Label
 var cache_label: Label
 var status_label: Label
+var chain_buttons: Array = []
+var tab_buttons: Array = []
+var archive_view: Control
+var aboard_view: Control
+var stage_empty: Control
+var stage_body: Control
 var stage_title: Label
+var stage_byline: Label
+var stage_ident: Label
+var stage_badges: HBoxContainer
+var stage_about: Label
+var stage_thumb: TextureRect
 var stage_feature: Button
+var file_tree: Tree
+var files_empty: Label
+var type_box: HFlowContainer
+var derivatives_toggle: CheckButton
+var select_note: Label
 var quote_label: Label
+var quote_others: Label
 var sol_note: Label
-var stage_list: VBoxContainer
+var host_hint: Label
+var open_button: Button
+var inscribe_button: Button
+var preview_box: Control
+var preview_title: Label
+var preview: RichTextLabel
+var picture: TextureRect
 var featured_box: HFlowContainer
 var place_row: HBoxContainer
 var place_label: Label
 var count_label: Label
+var page_label: Label
 var empty_label: Label
 var results_box: VBoxContainer
 var results_scroll: ScrollContainer
@@ -58,13 +88,9 @@ var sort_box: OptionButton
 var pager_prev: Button
 var pager_next: Button
 var media_buttons: Array = []
-var preview: RichTextLabel
-var picture: TextureRect
-var show_button: Button
 var search_box: LineEdit
 var add_row: HBoxContainer
 var add_box: LineEdit
-var chain_box: OptionButton
 var aboard_filter: LineEdit
 var aboard_box: VBoxContainer
 var aboard_note: Label
@@ -87,7 +113,27 @@ func _ready() -> void:
 	_build()
 	_refresh_cache()
 	_apply_mirror()
+	_show_invitation()
 	_discover()
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if not event is InputEventKey:
+		return
+	var key := event as InputEventKey
+	if not key.pressed or key.echo:
+		return
+	if key.keycode == KEY_F and key.ctrl_pressed:
+		if stage_body.visible and key.shift_pressed:
+			file_filter.grab_focus()
+		else:
+			_show_tab(0)
+			search_box.grab_focus()
+			search_box.select_all()
+		accept_event()
+	elif key.keycode == KEY_ESCAPE and preview_box.visible:
+		preview_box.visible = false
+		accept_event()
 
 
 func _load_cfg() -> void:
@@ -121,113 +167,152 @@ func _build() -> void:
 
 	var root := VBoxContainer.new()
 	root.set_anchors_preset(Control.PRESET_FULL_RECT)
-	root.offset_left = 12
-	root.offset_top = 8
-	root.offset_right = -12
+	root.offset_left = 16
+	root.offset_top = 10
+	root.offset_right = -16
 	root.offset_bottom = -8
-	root.add_theme_constant_override("separation", 8)
+	root.add_theme_constant_override("separation", 10)
 	add_child(root)
 
+	root.add_child(_top_bar())
+	root.add_child(ArkTheme.rule(ArkTheme.GOLD_DIM))
+
+	var split := HSplitContainer.new()
+	split.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	root.add_child(split)
+	var browse := _browse_pane()
+	browse.size_flags_stretch_ratio = 1.0
+	browse.custom_minimum_size = Vector2(440, 0)
+	split.add_child(browse)
+	var stage := _stage_pane()
+	stage.size_flags_stretch_ratio = 1.25
+	stage.custom_minimum_size = Vector2(560, 0)
+	split.add_child(stage)
+
+	var foot := HBoxContainer.new()
+	foot.add_theme_constant_override("separation", 12)
+	root.add_child(foot)
+	status_label = ArkTheme.cell("Search the Archive. Pick an item. Choose its files.", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	foot.add_child(status_label)
+	var keys := ArkTheme.cell("Ctrl+F search   Ctrl+Shift+F filter files   double-click a file to open it", ArkTheme.GOLD_DIM, ArkTheme.SIZE_SMALL)
+	keys.size_flags_horizontal = Control.SIZE_SHRINK_END
+	keys.clip_text = false
+	keys.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	foot.add_child(keys)
+
+
+func _top_bar() -> Control:
 	var top := HBoxContainer.new()
-	top.alignment = BoxContainer.ALIGNMENT_CENTER
 	top.add_theme_constant_override("separation", 12)
-	root.add_child(top)
-	top.add_child(ArkTheme.mark())
+	var mark := ArkTheme.mark()
+	mark.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	top.add_child(mark)
 	var word := ArkTheme.title("ARK")
 	word.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	top.add_child(word)
-	chain_box = OptionButton.new()
-	chain_box.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	for code in CHAINS:
-		chain_box.add_item(code.to_upper())
-	chain_box.selected = CHAINS.find(chain)
-	chain_box.item_selected.connect(_on_chain)
-	top.add_child(chain_box)
-	host_label = ArkTheme.line("HOST ...", ArkTheme.MUTED, ArkTheme.SIZE_SMALL)
-	host_label.autowrap_mode = TextServer.AUTOWRAP_OFF
-	host_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	var tag := ArkTheme.cell("Internet Archive, kept on chain", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	tag.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	top.add_child(tag)
+
+	var chains := HBoxContainer.new()
+	chains.add_theme_constant_override("separation", 0)
+	chains.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	top.add_child(chains)
+	chains.add_child(_spaced(ArkTheme.cell("CHAIN", ArkTheme.GOLD_DIM, ArkTheme.SIZE_SMALL), 8))
+	for at in CHAINS.size():
+		var code: String = CHAINS[at]
+		var b := ArkTheme.choice(code.to_upper(), code == chain, _on_chain.bind(at))
+		b.tooltip_text = "%s · fees in %s" % [CHAIN_NAMES[code], Costs.token(code)]
+		chains.add_child(b)
+		chain_buttons.append(b)
+
+	host_label = ArkTheme.badge("HOST …", ArkTheme.SEA)
+	host_label.add_theme_font_size_override("font_size", ArkTheme.SIZE_SMALL)
 	top.add_child(host_label)
-	cache_label = ArkTheme.line("", ArkTheme.GREY, ArkTheme.SIZE_SMALL)
-	cache_label.autowrap_mode = TextServer.AUTOWRAP_OFF
-	cache_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	cache_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	cache_label = ArkTheme.cell("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	cache_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	cache_label.clip_text = false
+	cache_label.size_flags_horizontal = Control.SIZE_SHRINK_END
+	cache_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	cache_label.tooltip_text = "Files opened or staged for inscription are kept on this machine."
+	cache_label.mouse_filter = Control.MOUSE_FILTER_PASS
 	top.add_child(cache_label)
-	var clear_all := ArkTheme.quiet_button("CLEAR ALL", _clear_all)
+	var clear_all := ArkTheme.quiet_button("CLEAR CACHE", _clear_all)
 	clear_all.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	clear_all.tooltip_text = "Delete every cached file on this machine. The chain is not touched."
 	top.add_child(clear_all)
-	root.add_child(ArkTheme.rule(ArkTheme.GOLD))
-
-	var body := HBoxContainer.new()
-	body.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	body.add_theme_constant_override("separation", 8)
-	root.add_child(body)
-	var archive := _archive_pane()
-	archive.size_flags_stretch_ratio = 2.4
-	body.add_child(archive)
-	var stage := _stage_pane()
-	stage.size_flags_stretch_ratio = 1.15
-	body.add_child(stage)
-	var aboard := _aboard_pane()
-	aboard.size_flags_stretch_ratio = 0.95
-	body.add_child(aboard)
-
-	root.add_child(ArkTheme.rule(ArkTheme.WATER))
-	status_label = ArkTheme.line("Search the Archive. Inscribe an item. Open what the chain already holds.", ArkTheme.GREY, ArkTheme.SIZE_SMALL)
-	status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	root.add_child(status_label)
+	return top
 
 
-func _archive_pane() -> Control:
-	var pane := ArkTheme.panel()
+func _spaced(control: Control, right: int) -> MarginContainer:
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_right", right)
+	margin.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	margin.add_child(control)
+	control.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	return margin
+
+
+func _pane_box(pane: PanelContainer) -> VBoxContainer:
+	var inner := MarginContainer.new()
+	for side in ["left", "right", "top", "bottom"]:
+		inner.add_theme_constant_override("margin_" + side, 6)
+	pane.add_child(inner)
 	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 10)
+	inner.add_child(box)
+	return box
+
+
+func _browse_pane() -> Control:
+	var pane := ArkTheme.panel()
+	var box := _pane_box(pane)
+	var tabs := HBoxContainer.new()
+	tabs.add_theme_constant_override("separation", 0)
+	box.add_child(tabs)
+	for at in 2:
+		var label := "ARCHIVE" if at == 0 else "ABOARD"
+		var b := ArkTheme.choice(label, at == 0, _show_tab.bind(at))
+		b.custom_minimum_size = Vector2(120, 30)
+		tabs.add_child(b)
+		tab_buttons.append(b)
+	tab_buttons[0].tooltip_text = "Search and browse the Internet Archive."
+	tab_buttons[1].tooltip_text = "What the selected chain already holds."
+	archive_view = _archive_view()
+	box.add_child(archive_view)
+	aboard_view = _aboard_view()
+	aboard_view.visible = false
+	box.add_child(aboard_view)
+	return pane
+
+
+func _show_tab(at: int) -> void:
+	archive_view.visible = at == 0
+	aboard_view.visible = at == 1
+	for i in tab_buttons.size():
+		ArkTheme.paint_choice(tab_buttons[i], i == at)
+
+
+func _archive_view() -> Control:
+	var box := VBoxContainer.new()
+	box.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	box.add_theme_constant_override("separation", 8)
-	pane.add_child(box)
-	box.add_child(ArkTheme.header("ARCHIVE"))
-	featured_box = HFlowContainer.new()
-	featured_box.add_theme_constant_override("h_separation", 6)
-	featured_box.add_theme_constant_override("v_separation", 4)
-	featured_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	featured_box.visible = false
-	box.add_child(featured_box)
-	place_row = HBoxContainer.new()
-	place_row.add_theme_constant_override("separation", 8)
-	place_row.visible = false
-	box.add_child(place_row)
-	var back := ArkTheme.quiet_button("BACK", _back)
-	back.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	place_row.add_child(back)
-	place_label = ArkTheme.cell("", ArkTheme.GOLD, ArkTheme.SIZE_SMALL)
-	place_row.add_child(place_label)
-	var feature := ArkTheme.quiet_button("FEATURE", _feature_current)
-	feature.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	place_row.add_child(feature)
-	var check := ArkTheme.quiet_button("CHECK", _check_current)
-	check.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	place_row.add_child(check)
-	add_row = HBoxContainer.new()
-	add_row.add_theme_constant_override("separation", 8)
-	add_row.visible = false
-	box.add_child(add_row)
-	add_box = LineEdit.new()
-	add_box.placeholder_text = "Add an identifier"
-	add_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	add_box.text_submitted.connect(func(_text: String) -> void: _add_to_kind())
-	add_row.add_child(add_box)
-	var add := ArkTheme.quiet_button("ADD", _add_to_kind)
-	add.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	add_row.add_child(add)
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 8)
 	box.add_child(row)
 	search_box = LineEdit.new()
 	search_box.placeholder_text = "Search titles, creators, collections"
-	search_box.custom_minimum_size = Vector2(0, 34)
+	search_box.custom_minimum_size = Vector2(0, 36)
+	search_box.clear_button_enabled = true
 	search_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	search_box.text_submitted.connect(func(_t: String) -> void: _search_fresh())
 	row.add_child(search_box)
-	row.add_child(ArkTheme.primary_button("SEARCH", _search_fresh))
+	var go := ArkTheme.primary_button("SEARCH", _search_fresh)
+	go.custom_minimum_size = Vector2(96, 0)
+	row.add_child(go)
 	var media := HFlowContainer.new()
-	media.add_theme_constant_override("h_separation", 6)
+	media.add_theme_constant_override("h_separation", 4)
 	media.add_theme_constant_override("v_separation", 4)
 	media.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	box.add_child(media)
@@ -235,25 +320,77 @@ func _archive_pane() -> Control:
 		var chip := _media_chip(str(pair[0]), str(pair[1]))
 		media.add_child(chip)
 		media_buttons.append({"kind": str(pair[0]), "button": chip})
+	featured_box = HFlowContainer.new()
+	featured_box.add_theme_constant_override("h_separation", 4)
+	featured_box.add_theme_constant_override("v_separation", 4)
+	featured_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	featured_box.visible = false
+	box.add_child(featured_box)
+
+	place_row = HBoxContainer.new()
+	place_row.add_theme_constant_override("separation", 8)
+	place_row.visible = false
+	box.add_child(place_row)
+	var back := ArkTheme.quiet_button("‹ BACK", _back)
+	back.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	place_row.add_child(back)
+	place_label = ArkTheme.cell("", ArkTheme.GOLD, ArkTheme.SIZE_BODY)
+	place_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	place_row.add_child(place_label)
+	var feature := ArkTheme.quiet_button("FEATURE", _feature_current)
+	feature.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	feature.tooltip_text = "Put this collection on the featured band so others help finish it."
+	place_row.add_child(feature)
+	var check := ArkTheme.quiet_button("CHECK", _check_current)
+	check.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	check.tooltip_text = "Count how much of this collection is aboard."
+	place_row.add_child(check)
+	add_row = HBoxContainer.new()
+	add_row.add_theme_constant_override("separation", 8)
+	add_row.visible = false
+	box.add_child(add_row)
+	add_box = LineEdit.new()
+	add_box.placeholder_text = "Add an identifier to this shelf"
+	add_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	add_box.text_submitted.connect(func(_text: String) -> void: _add_to_kind())
+	add_row.add_child(add_box)
+	var add := ArkTheme.quiet_button("ADD", _add_to_kind)
+	add.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	add_row.add_child(add)
+
 	var meta := HBoxContainer.new()
 	meta.add_theme_constant_override("separation", 8)
 	meta.visible = false
 	box.add_child(meta)
+	count_label = ArkTheme.cell("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	count_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	meta.add_child(count_label)
 	sort_box = OptionButton.new()
 	sort_box.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	for label in ["Relevance", "Downloads", "Date published", "Date archived", "Title"]:
+	sort_box.add_theme_font_size_override("font_size", ArkTheme.SIZE_SMALL)
+	sort_box.tooltip_text = "Sort results"
+	for label in ["Relevance", "Most downloaded", "Newest published", "Newest archived", "Title A–Z"]:
 		sort_box.add_item(label)
 	sort_box.selected = 1
 	sort_box.item_selected.connect(_on_sort)
 	meta.add_child(sort_box)
-	count_label = ArkTheme.cell("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
-	meta.add_child(count_label)
-	pager_prev = ArkTheme.quiet_button("PREV", _page_prev)
-	pager_next = ArkTheme.quiet_button("NEXT", _page_next)
+	pager_prev = ArkTheme.quiet_button("‹", _page_prev)
+	pager_prev.custom_minimum_size = Vector2(28, 0)
+	pager_prev.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	meta.add_child(pager_prev)
+	page_label = ArkTheme.cell("", ArkTheme.PARCHMENT, ArkTheme.SIZE_SMALL)
+	page_label.clip_text = false
+	page_label.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	page_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	meta.add_child(page_label)
+	pager_next = ArkTheme.quiet_button("›", _page_next)
+	pager_next.custom_minimum_size = Vector2(28, 0)
+	pager_next.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	meta.add_child(pager_next)
-	empty_label = ArkTheme.line("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
-	empty_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+
+	empty_label = ArkTheme.line("", ArkTheme.SEA, ArkTheme.SIZE_BODY)
+	empty_label.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	empty_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	empty_label.visible = false
 	box.add_child(empty_label)
 	results_scroll = ScrollContainer.new()
@@ -265,90 +402,27 @@ func _archive_pane() -> Control:
 	results_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	results_box.add_theme_constant_override("separation", 0)
 	results_scroll.add_child(results_box)
-	return pane
+	return box
 
 
-func _stage_pane() -> Control:
-	var pane := ArkTheme.panel()
+func _aboard_view() -> Control:
 	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 6)
-	pane.add_child(box)
-	box.add_child(ArkTheme.header("STAGE"))
-	stage_title = ArkTheme.line("No item.", ArkTheme.YELLOW, ArkTheme.SIZE_SMALL)
-	stage_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	box.add_child(stage_title)
-	stage_feature = ArkTheme.quiet_button("FEATURE", _feature_item)
-	stage_feature.visible = false
-	stage_feature.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-	box.add_child(stage_feature)
-	file_filter = LineEdit.new()
-	file_filter.placeholder_text = "Filter files"
-	file_filter.visible = false
-	file_filter.text_changed.connect(func(_text: String) -> void: _on_file_filter())
-	box.add_child(file_filter)
-	stage_scroll = ScrollContainer.new()
-	stage_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	stage_scroll.custom_minimum_size = Vector2(0, 220)
-	stage_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	box.add_child(stage_scroll)
-	stage_list = VBoxContainer.new()
-	stage_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	stage_list.add_theme_constant_override("separation", 8)
-	stage_scroll.add_child(stage_list)
-	stage_note = ArkTheme.line("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
-	stage_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	stage_note.visible = false
-	box.add_child(stage_note)
-	quote_label = ArkTheme.line("", ArkTheme.GREY, ArkTheme.SIZE_SMALL)
-	quote_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	box.add_child(quote_label)
-	sol_note = ArkTheme.line(
-		"Solana's approval chunks at 3400 bytes. The write path chunks at 850, so the real fee runs higher.",
-		ArkTheme.AMBER,
-		ArkTheme.SIZE_SMALL
-	)
-	sol_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	sol_note.visible = false
-	box.add_child(sol_note)
-	var actions := HBoxContainer.new()
-	box.add_child(actions)
-	actions.add_child(ArkTheme.primary_button("OPEN", _open_checked))
-	actions.add_child(ArkTheme.button("INSCRIBE", _inscribe_checked))
-	show_button = ArkTheme.quiet_button("SHOW ALL", _toggle_derivatives)
-	actions.add_child(show_button)
-	actions.add_child(ArkTheme.quiet_button("CLEAR ITEM", _clear_item))
-	picture = TextureRect.new()
-	picture.custom_minimum_size = Vector2(0, 120)
-	picture.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	picture.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	picture.visible = false
-	box.add_child(picture)
-	preview = RichTextLabel.new()
-	preview.custom_minimum_size = Vector2(0, 80)
-	preview.scroll_active = true
-	preview.visible = false
-	box.add_child(preview)
-	return pane
-
-
-func _aboard_pane() -> Control:
-	var pane := ArkTheme.panel()
-	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 6)
-	pane.add_child(box)
-	box.add_child(ArkTheme.header("ABOARD"))
+	box.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	box.add_theme_constant_override("separation", 8)
 	aboard_note = ArkTheme.line(
 		"The cabinet is the manifest on the selected chain. It fills when a host is attached.",
-		ArkTheme.MUTED,
+		ArkTheme.SEA,
 		ArkTheme.SIZE_SMALL
 	)
 	aboard_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	box.add_child(aboard_note)
 	var tools := HBoxContainer.new()
-	tools.add_theme_constant_override("separation", 6)
+	tools.add_theme_constant_override("separation", 8)
 	box.add_child(tools)
 	aboard_filter = LineEdit.new()
 	aboard_filter.placeholder_text = "Filter the cabinet"
+	aboard_filter.clear_button_enabled = true
+	aboard_filter.custom_minimum_size = Vector2(0, 36)
 	aboard_filter.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	aboard_filter.text_changed.connect(func(_text: String) -> void:
 		_aboard_page.clear()
@@ -357,6 +431,7 @@ func _aboard_pane() -> Control:
 	tools.add_child(aboard_filter)
 	var repair := ArkTheme.quiet_button("REPAIR", _repair_aboard)
 	repair.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	repair.tooltip_text = "Add manifest rows for item tables that are complete but unlisted."
 	tools.add_child(repair)
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -364,13 +439,279 @@ func _aboard_pane() -> Control:
 	box.add_child(scroll)
 	aboard_box = VBoxContainer.new()
 	aboard_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	aboard_box.add_theme_constant_override("separation", 4)
+	aboard_box.add_theme_constant_override("separation", 0)
 	scroll.add_child(aboard_box)
+	return box
+
+
+func _stage_pane() -> Control:
+	var pane := ArkTheme.panel()
+	var holder := _pane_box(pane)
+	stage_empty = _stage_welcome()
+	holder.add_child(stage_empty)
+	stage_body = VBoxContainer.new()
+	stage_body.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	stage_body.add_theme_constant_override("separation", 10)
+	stage_body.visible = false
+	holder.add_child(stage_body)
+	var box := stage_body
+
+	var head := HBoxContainer.new()
+	head.add_theme_constant_override("separation", 14)
+	box.add_child(head)
+	var frame := PanelContainer.new()
+	frame.add_theme_stylebox_override("panel", ArkTheme.well(ArkTheme.HULL_RAISED, 0))
+	frame.custom_minimum_size = Vector2(128, 96)
+	frame.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
+	head.add_child(frame)
+	stage_thumb = TextureRect.new()
+	stage_thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	stage_thumb.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	frame.add_child(stage_thumb)
+	var words := VBoxContainer.new()
+	words.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	words.add_theme_constant_override("separation", 4)
+	head.add_child(words)
+	stage_title = ArkTheme.line("", ArkTheme.FOAM, ArkTheme.SIZE_DISPLAY)
+	stage_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	stage_title.max_lines_visible = 2
+	stage_title.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	words.add_child(stage_title)
+	stage_byline = ArkTheme.cell("", ArkTheme.WATER, ArkTheme.SIZE_SMALL)
+	words.add_child(stage_byline)
+	var ident_row := HBoxContainer.new()
+	ident_row.add_theme_constant_override("separation", 6)
+	words.add_child(ident_row)
+	stage_badges = HBoxContainer.new()
+	stage_badges.add_theme_constant_override("separation", 6)
+	ident_row.add_child(stage_badges)
+	stage_ident = ArkTheme.cell("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	stage_ident.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	ident_row.add_child(stage_ident)
+	stage_about = ArkTheme.line("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	stage_about.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	stage_about.max_lines_visible = 2
+	stage_about.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	words.add_child(stage_about)
+	var side := VBoxContainer.new()
+	side.add_theme_constant_override("separation", 6)
+	head.add_child(side)
+	var web := ArkTheme.quiet_button("ARCHIVE.ORG ↗", _open_details)
+	web.tooltip_text = "Open this item's page on archive.org"
+	side.add_child(web)
+	stage_feature = ArkTheme.quiet_button("FEATURE", _feature_item)
+	stage_feature.tooltip_text = "Feature this item so others help bring all of it aboard."
+	side.add_child(stage_feature)
+	var forget := ArkTheme.quiet_button("CLEAR CACHE", _clear_item)
+	forget.tooltip_text = "Delete this item's cached files on this machine. The chain is not touched."
+	side.add_child(forget)
+
+	box.add_child(ArkTheme.rule(ArkTheme.GOLD_DIM))
+
+	var tools := HBoxContainer.new()
+	tools.add_theme_constant_override("separation", 10)
+	box.add_child(tools)
+	file_filter = LineEdit.new()
+	file_filter.placeholder_text = "Filter files by name"
+	file_filter.clear_button_enabled = true
+	file_filter.custom_minimum_size = Vector2(0, 32)
+	file_filter.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	file_filter.text_changed.connect(func(_text: String) -> void: _filter_timer.start())
+	tools.add_child(file_filter)
+	_filter_timer = Timer.new()
+	_filter_timer.one_shot = true
+	_filter_timer.wait_time = 0.15
+	_filter_timer.timeout.connect(_on_file_filter)
+	add_child(_filter_timer)
+	derivatives_toggle = CheckButton.new()
+	derivatives_toggle.text = "Derivatives"
+	derivatives_toggle.focus_mode = Control.FOCUS_NONE
+	derivatives_toggle.tooltip_text = "Also list files the Archive generated from the originals: thumbnails, transcodes, metadata."
+	derivatives_toggle.toggled.connect(_toggle_derivatives)
+	tools.add_child(derivatives_toggle)
+
+	var picks := HBoxContainer.new()
+	picks.add_theme_constant_override("separation", 6)
+	box.add_child(picks)
+	type_box = HFlowContainer.new()
+	type_box.add_theme_constant_override("h_separation", 4)
+	type_box.add_theme_constant_override("v_separation", 4)
+	type_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	picks.add_child(type_box)
+	var all := ArkTheme.quiet_button("SELECT SHOWN", _select_shown.bind(true))
+	all.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
+	all.tooltip_text = "Tick every file the filter and type currently show."
+	picks.add_child(all)
+	var none := ArkTheme.quiet_button("CLEAR", _select_none)
+	none.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
+	none.tooltip_text = "Untick every file."
+	picks.add_child(none)
+
+	file_tree = Tree.new()
+	file_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	file_tree.columns = 4
+	file_tree.hide_root = true
+	file_tree.column_titles_visible = true
+	file_tree.select_mode = Tree.SELECT_ROW
+	file_tree.allow_reselect = true
+	file_tree.set_column_expand(FILE_COL_NAME, true)
+	file_tree.set_column_clip_content(FILE_COL_NAME, true)
+	for col in [FILE_COL_FORMAT, FILE_COL_SIZE, FILE_COL_STATE]:
+		file_tree.set_column_expand(col, false)
+	file_tree.set_column_custom_minimum_width(FILE_COL_FORMAT, 140)
+	file_tree.set_column_custom_minimum_width(FILE_COL_SIZE, 116)
+	file_tree.set_column_custom_minimum_width(FILE_COL_STATE, 72)
+	file_tree.set_column_title_alignment(FILE_COL_SIZE, HORIZONTAL_ALIGNMENT_RIGHT)
+	file_tree.item_edited.connect(_on_file_edited)
+	file_tree.item_activated.connect(_on_file_activated)
+	file_tree.column_title_clicked.connect(_on_file_sort)
+	box.add_child(file_tree)
+	_paint_file_titles()
+	files_empty = ArkTheme.line("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	files_empty.set_anchors_preset(Control.PRESET_FULL_RECT)
+	files_empty.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	files_empty.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	files_empty.visible = false
+	file_tree.add_child(files_empty)
+
+	preview_box = _preview_drawer()
+	box.add_child(preview_box)
+
+	box.add_child(_action_bar())
 	return pane
+
+
+func _stage_welcome() -> Control:
+	var center := CenterContainer.new()
+	center.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var box := VBoxContainer.new()
+	box.custom_minimum_size = Vector2(380, 0)
+	box.add_theme_constant_override("separation", 14)
+	center.add_child(box)
+	var big := ArkTheme.mark()
+	big.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	box.add_child(big)
+	box.add_child(ArkTheme.line("No item open", ArkTheme.GOLD, ArkTheme.SIZE_DISPLAY))
+	var steps := [
+		["1", "Find it", "Search the Archive, open a collection, or browse what is already aboard."],
+		["2", "Pick the files", "Click an item. Filter by name or type, tick what to keep."],
+		["3", "Open or inscribe", "OPEN reads it on this machine. INSCRIBE writes it to the chain."],
+	]
+	for step in steps:
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 12)
+		box.add_child(row)
+		var n := ArkTheme.badge(str(step[0]), ArkTheme.GOLD)
+		n.add_theme_font_size_override("font_size", ArkTheme.SIZE_BODY)
+		n.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
+		row.add_child(n)
+		var words := VBoxContainer.new()
+		words.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		words.add_theme_constant_override("separation", 2)
+		row.add_child(words)
+		var head := ArkTheme.line(str(step[1]), ArkTheme.PARCHMENT, ArkTheme.SIZE_BODY)
+		head.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+		words.add_child(head)
+		var tip := ArkTheme.line(str(step[2]), ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+		tip.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+		words.add_child(tip)
+	return center
+
+
+func _preview_drawer() -> Control:
+	var drawer := PanelContainer.new()
+	drawer.add_theme_stylebox_override("panel", ArkTheme.well(ArkTheme.INK, 8))
+	drawer.visible = false
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 6)
+	drawer.add_child(box)
+	var head := HBoxContainer.new()
+	box.add_child(head)
+	preview_title = ArkTheme.cell("", ArkTheme.GOLD, ArkTheme.SIZE_SMALL)
+	preview_title.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	head.add_child(preview_title)
+	head.add_child(ArkTheme.quiet_button("CLOSE", func() -> void: drawer.visible = false))
+	picture = TextureRect.new()
+	picture.custom_minimum_size = Vector2(0, 200)
+	picture.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	picture.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	picture.visible = false
+	box.add_child(picture)
+	preview = RichTextLabel.new()
+	preview.custom_minimum_size = Vector2(0, 200)
+	preview.scroll_active = true
+	preview.selection_enabled = true
+	preview.visible = false
+	box.add_child(preview)
+	return drawer
+
+
+func _action_bar() -> Control:
+	var bar := PanelContainer.new()
+	bar.add_theme_stylebox_override("panel", ArkTheme.well(ArkTheme.HULL_RAISED, 12))
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 18)
+	bar.add_child(row)
+	var picked_box := VBoxContainer.new()
+	picked_box.add_theme_constant_override("separation", 2)
+	picked_box.custom_minimum_size = Vector2(190, 0)
+	row.add_child(picked_box)
+	select_note = ArkTheme.cell("Nothing selected", ArkTheme.PARCHMENT, ArkTheme.SIZE_BODY)
+	picked_box.add_child(select_note)
+	stage_note = ArkTheme.cell("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	picked_box.add_child(stage_note)
+	var cost_box := VBoxContainer.new()
+	cost_box.add_theme_constant_override("separation", 2)
+	cost_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(cost_box)
+	quote_label = ArkTheme.cell("", ArkTheme.GOLD, ArkTheme.SIZE_BODY)
+	quote_label.tooltip_text = "Estimated fees to write the selected files, their item card and manifest row."
+	quote_label.mouse_filter = Control.MOUSE_FILTER_PASS
+	cost_box.add_child(quote_label)
+	quote_others = ArkTheme.line("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	quote_others.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	cost_box.add_child(quote_others)
+	sol_note = ArkTheme.line(
+		"Solana's approval chunks at 3400 bytes. The write path chunks at 850, so the real fee runs higher.",
+		ArkTheme.CLAY,
+		ArkTheme.SIZE_SMALL
+	)
+	sol_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	sol_note.visible = false
+	cost_box.add_child(sol_note)
+	host_hint = ArkTheme.line("No host attached. Launch Ark from GodOnChain to inscribe.", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	host_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	host_hint.visible = false
+	cost_box.add_child(host_hint)
+	open_button = ArkTheme.button("OPEN", _open_checked)
+	open_button.custom_minimum_size = Vector2(96, 40)
+	open_button.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	open_button.tooltip_text = "Download the selected files to this machine and open them."
+	row.add_child(open_button)
+	inscribe_button = ArkTheme.primary_button("INSCRIBE", _inscribe_checked)
+	inscribe_button.custom_minimum_size = Vector2(128, 40)
+	inscribe_button.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	inscribe_button.tooltip_text = "Write the selected files to the chain. You approve each write in GodOnChain."
+	row.add_child(inscribe_button)
+	_sync_actions()
+	return bar
+
+
+func _sync_actions() -> void:
+	if open_button == null:
+		return
+	var count := _selected_files().size()
+	var none := item.is_empty() or count == 0
+	open_button.disabled = none
+	inscribe_button.disabled = none
+	var hosted := iq != null and iq.is_available()
+	host_hint.visible = not hosted and not item.is_empty()
 
 
 func _on_chain(index: int) -> void:
 	chain = CHAINS[index]
+	for at in chain_buttons.size():
+		ArkTheme.paint_choice(chain_buttons[at], at == index)
 	_save_cfg()
 	sol_note.visible = chain == "sol"
 	_quote()
@@ -379,12 +720,17 @@ func _on_chain(index: int) -> void:
 
 func _discover() -> void:
 	var ok: bool = await iq.discover()
+	var colour := ArkTheme.GREEN if ok else ArkTheme.SEA
 	if ok:
-		host_label.text = "HOST  %s" % iq.app_label
-		host_label.add_theme_color_override("font_color", ArkTheme.GREEN)
+		host_label.text = "● %s" % iq.app_label
+		host_label.tooltip_text = "GodOnChain is attached. Inscribe, Feature and read-back are available."
 	else:
-		host_label.text = "HOST  absent"
-		host_label.add_theme_color_override("font_color", ArkTheme.MUTED)
+		host_label.text = "○ NO HOST · BROWSE ONLY"
+		host_label.tooltip_text = "Search and OPEN work now. Launch Ark from GodOnChain to inscribe."
+	host_label.mouse_filter = Control.MOUSE_FILTER_PASS
+	host_label.add_theme_color_override("font_color", colour)
+	host_label.add_theme_stylebox_override("normal", ArkTheme._box(colour, Color(colour, 0.1), 8, 3, 1))
+	_sync_actions()
 	await _refresh_board()
 
 
@@ -409,6 +755,7 @@ func _run_search() -> void:
 		_show_invitation()
 		return
 	var waiting := "Opening %s" % collection_title if not collection_id.is_empty() else "Searching"
+	_show_tab(0)
 	_show_wait(waiting)
 	await get_tree().process_frame
 	if token != _catalog:
@@ -451,7 +798,8 @@ func _show_invitation() -> void:
 	_clear_results()
 	_meta().visible = false
 	results_scroll.visible = false
-	empty_label.visible = false
+	empty_label.visible = true
+	empty_label.text = "Search by title, creator or collection.\nOr pick a mediatype above to browse the most downloaded."
 	_status("Search the Archive. A mediatype narrows it.")
 
 
@@ -459,10 +807,17 @@ func _paint_hits(found: int, window: Dictionary) -> void:
 	_clear_results()
 	var meta := _meta()
 	meta.visible = true
-	count_label.text = Archive.result_count(window, found)
+	var counted := Archive.result_count(window, found).split("  ·  ")
+	count_label.text = counted[0]
+	count_label.tooltip_text = "Only the " + counted[1] + "." if counted.size() > 1 else ""
+	count_label.mouse_filter = Control.MOUSE_FILTER_PASS
 	var pages := int(window.get("pages", 0))
 	pager_prev.disabled = page <= 1
 	pager_next.disabled = pages == 0 or page >= pages
+	page_label.visible = pages > 1
+	page_label.text = "%s / %s" % [Archive.grouped(page), Archive.grouped(pages)]
+	pager_prev.visible = pages > 1
+	pager_next.visible = pages > 1
 	found_count = found
 	empty_label.visible = found <= 0
 	empty_label.text = "Nothing matches this search."
@@ -640,32 +995,56 @@ func _featured_chip(label: String, title: String, ia: String, slug: String) -> B
 	)
 
 
-func _hit_row(hit: Dictionary) -> Dictionary:
+## A clickable list row. It stays lit while its item is the one open.
+func _clickable_row(ident: String, on_click: Callable) -> PanelContainer:
 	var panel := PanelContainer.new()
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	var idle := _row_box(false)
-	var hot := _row_box(true)
-	panel.add_theme_stylebox_override("panel", idle)
+	panel.set_meta("ident", ident)
+	panel.set_meta("hot", false)
+	_paint_row(panel)
 	panel.mouse_entered.connect(func() -> void:
-		panel.add_theme_stylebox_override("panel", hot)
+		panel.set_meta("hot", true)
+		_paint_row(panel)
 	)
 	panel.mouse_exited.connect(func() -> void:
-		panel.add_theme_stylebox_override("panel", idle)
+		panel.set_meta("hot", false)
+		_paint_row(panel)
 	)
 	panel.gui_input.connect(func(event: InputEvent) -> void:
 		if event is InputEventMouseButton:
 			var mouse := event as InputEventMouseButton
 			if mouse.pressed and mouse.button_index == MOUSE_BUTTON_LEFT:
 				panel.accept_event()
-				await _open_hit(hit)
+				await on_click.call()
 	)
+	return panel
+
+
+func _paint_row(panel: PanelContainer) -> void:
+	var staged := not item.is_empty() and str(panel.get_meta("ident", "")) == str(item.get("identifier", ""))
+	panel.add_theme_stylebox_override("panel", _row_box(bool(panel.get_meta("hot", false)), staged))
+
+
+func _paint_rows() -> void:
+	for list in [results_box, aboard_box]:
+		if list == null:
+			continue
+		for child in list.get_children():
+			if child is PanelContainer and child.has_meta("ident"):
+				_paint_row(child)
+
+
+func _hit_row(hit: Dictionary) -> Dictionary:
+	var ident := str(hit.get("identifier", ""))
+	var panel := _clickable_row(ident, func() -> void: await _open_hit(hit))
 	var row := HBoxContainer.new()
 	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	row.add_theme_constant_override("separation", 10)
+	row.add_theme_constant_override("separation", 12)
 	panel.add_child(row)
 	var frame := Control.new()
-	frame.custom_minimum_size = Vector2(84, 64)
+	frame.custom_minimum_size = Vector2(80, 60)
+	frame.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
 	frame.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	row.add_child(frame)
 	var wash := ColorRect.new()
@@ -692,21 +1071,18 @@ func _hit_row(hit: Dictionary) -> Dictionary:
 	title.add_theme_font_size_override("font_size", ArkTheme.SIZE_BODY)
 	title.add_theme_color_override("font_color", ArkTheme.PARCHMENT)
 	words.add_child(title)
-	var by := Label.new()
-	var by_text := Archive.byline(hit)
-	var ident := str(hit.get("identifier", ""))
-	var aboard := _aboard_ids.has(ident)
-	if aboard:
-		by_text = "Aboard · " + by_text if not by_text.is_empty() else "Aboard"
-	elif not collection_id.is_empty():
-		by_text = "Not yet aboard · " + by_text if not by_text.is_empty() else "Not yet aboard"
-	by.text = by_text
-	by.clip_text = true
-	by.max_lines_visible = 1
+	var tags := HBoxContainer.new()
+	tags.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	tags.add_theme_constant_override("separation", 6)
+	words.add_child(tags)
+	if str(hit.get("mediatype", "")) == "collection":
+		tags.add_child(ArkTheme.badge("COLLECTION ›", ArkTheme.WATER))
+	if _aboard_ids.has(ident):
+		tags.add_child(ArkTheme.badge("ABOARD", ArkTheme.LAMP))
+	var by := ArkTheme.cell(Archive.byline(hit), ArkTheme.WATER, ArkTheme.SIZE_SMALL)
 	by.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	by.add_theme_font_size_override("font_size", ArkTheme.SIZE_SMALL)
-	by.add_theme_color_override("font_color", ArkTheme.LAMP if aboard else ArkTheme.WATER)
-	words.add_child(by)
+	by.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	tags.add_child(by)
 	var blurb := str(hit.get("description", ""))
 	if not blurb.is_empty():
 		var about := Label.new()
@@ -720,19 +1096,20 @@ func _hit_row(hit: Dictionary) -> Dictionary:
 	return {"row": panel, "thumb": thumb}
 
 
-func _row_box(hot: bool) -> StyleBoxFlat:
+func _row_box(hot: bool, staged: bool = false) -> StyleBoxFlat:
 	var box := StyleBoxFlat.new()
-	box.bg_color = ArkTheme.HULL_RAISED if hot else Color(0, 0, 0, 0)
-	box.draw_center = hot
+	box.bg_color = ArkTheme.HULL_RAISED if hot or staged else Color(0, 0, 0, 0)
+	box.draw_center = hot or staged
 	box.set_corner_radius_all(0)
-	box.content_margin_left = 6
-	box.content_margin_right = 6
+	box.content_margin_left = 8
+	box.content_margin_right = 8
 	box.content_margin_top = 8
 	box.content_margin_bottom = 8
-	box.border_color = ArkTheme.GOLD if hot else ArkTheme.GOLD_DIM
+	box.border_color = ArkTheme.GOLD if hot or staged else Color(ArkTheme.GOLD_DIM, 0.45)
 	box.border_width_bottom = 1
-	if hot:
-		box.border_width_left = 2
+	if hot or staged:
+		box.border_width_left = 3
+		box.content_margin_left = 6
 	return box
 
 
@@ -810,7 +1187,12 @@ func _load_item(identifier: String) -> void:
 		return
 	_status("Reading the file list…")
 	await get_tree().process_frame
-	item = Archive.parse_metadata(body)
+	var parsed := Archive.parse_metadata(body)
+	if (parsed.get("files", []) as Array).is_empty() and str(parsed.get("title", "")).is_empty():
+		busy = false
+		_status("The Archive has no item called %s, or it is dark." % identifier)
+		return
+	item = parsed
 	item["from_chain"] = false
 	if str(item.get("identifier", "")).is_empty():
 		item["identifier"] = identifier
@@ -821,12 +1203,20 @@ func _load_item(identifier: String) -> void:
 
 func _fill_stage() -> void:
 	var identifier := str(item.get("identifier", ""))
-	stage_title.text = "%s   %s" % [str(item.get("title", identifier)), str(item.get("mediatype", ""))]
-	if stage_feature != null:
-		stage_feature.visible = not identifier.is_empty()
-	picture.visible = false
-	preview.visible = false
+	# A refill of the same item (the derivatives toggle) keeps what was ticked.
+	var kept := {}
+	var same := identifier == str(stage_body.get_meta("ident", ""))
+	if same:
+		for file in _selected_files():
+			kept[str((file as Dictionary).get("name", ""))] = true
+	stage_body.set_meta("ident", identifier)
+	stage_empty.visible = false
+	stage_body.visible = true
+	_paint_item_head()
+	if not same:
+		preview_box.visible = false
 	var from_chain := bool(item.get("from_chain", false))
+	derivatives_toggle.visible = not from_chain
 	var hidden: Callable = Archive.is_hidden_file
 	if from_chain or show_all:
 		hidden = func(_file: Dictionary) -> bool: return false
@@ -841,176 +1231,265 @@ func _fill_stage() -> void:
 	stage_files = Archive.arrange_files(visible)
 	picked = {}
 	for at in stage_files.size():
-		picked[at] = checked.has(str((stage_files[at] as Dictionary).get("name", "")))
+		var name := str((stage_files[at] as Dictionary).get("name", ""))
+		picked[at] = kept.has(name) if same else checked.has(name)
 	_stage_lock = true
-	if file_filter != null:
+	if not same:
 		file_filter.text = ""
-		file_filter.visible = stage_files.size() > STAGE_PAGE
+		file_type = ""
 	_stage_lock = false
-	stage_shown = STAGE_PAGE
+	_paint_types()
 	_paint_stage_files()
+	_paint_rows()
 	_quote()
+
+
+func _paint_item_head() -> void:
+	var identifier := str(item.get("identifier", ""))
+	var title := str(item.get("title", "")).strip_edges()
+	stage_title.text = title if not title.is_empty() else identifier
+	stage_title.tooltip_text = stage_title.text
+	var parts := PackedStringArray()
+	for key in ["creator", "date"]:
+		var value := str(item.get(key, "")).strip_edges()
+		if not value.is_empty():
+			parts.append(value)
+	var kind := Archive.mediatype_label(str(item.get("mediatype", "")))
+	if not kind.is_empty():
+		parts.append(kind)
+	var size := int(str(item.get("item_size", "0")))
+	if size > 0:
+		parts.append(_human_bytes(size))
+	stage_byline.text = " · ".join(parts)
+	stage_ident.text = identifier
+	stage_ident.tooltip_text = identifier
+	for child in stage_badges.get_children():
+		child.queue_free()
+	if bool(item.get("from_chain", false)):
+		stage_badges.add_child(ArkTheme.badge("READ FROM %s" % chain.to_upper(), ArkTheme.LAMP))
+	elif _aboard_ids.has(identifier):
+		stage_badges.add_child(ArkTheme.badge("ABOARD %s" % chain.to_upper(), ArkTheme.LAMP))
+	stage_badges.visible = bool(item.get("from_chain", false)) or _aboard_ids.has(identifier)
+	stage_about.text = Archive.plain_text(str(item.get("description", "")))
+	stage_about.visible = not stage_about.text.is_empty()
+	stage_about.tooltip_text = stage_about.text.substr(0, 1200)
+	stage_feature.visible = not identifier.is_empty()
+	stage_thumb.texture = _thumbs.get(identifier, null)
+	if stage_thumb.texture == null and not identifier.is_empty():
+		_fetch_head_thumb(identifier)
+
+
+func _fetch_head_thumb(identifier: String) -> void:
+	var http := HTTPRequest.new()
+	http.timeout = 12
+	add_child(http)
+	http.request_completed.connect(func(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
+			var image := Image.new()
+			if Archive.decode_image(body, image):
+				var texture := ImageTexture.create_from_image(image)
+				_thumbs[identifier] = texture
+				if str(item.get("identifier", "")) == identifier:
+					stage_thumb.texture = texture
+		http.queue_free()
+	)
+	if http.request(Archive.thumb_url(identifier), ["User-Agent: %s" % Archive.USER_AGENT]) != OK:
+		http.queue_free()
+
+
+func _open_details() -> void:
+	var identifier := str(item.get("identifier", ""))
+	if not identifier.is_empty():
+		OS.shell_open("https://archive.org/details/" + identifier.uri_encode())
+
+
+## One chip per format, largest first, each with its count.
+func _paint_types() -> void:
+	for child in type_box.get_children():
+		child.queue_free()
+	var counts := {}
+	for file in stage_files:
+		var section := Archive.file_section(file)
+		counts[section] = int(counts.get(section, 0)) + 1
+	var order: Array = counts.keys()
+	order.sort_custom(func(a: String, b: String) -> bool:
+		if counts[a] != counts[b]:
+			return counts[a] > counts[b]
+		return a.nocasecmp_to(b) < 0
+	)
+	if not file_type.is_empty() and not counts.has(file_type):
+		file_type = ""
+	type_box.add_child(_type_chip("", "All  %s" % Archive.grouped(stage_files.size())))
+	if order.size() < 2:
+		return
+	for section in order:
+		type_box.add_child(_type_chip(str(section), "%s  %s" % [section, Archive.grouped(int(counts[section]))]))
+
+
+func _type_chip(section: String, label: String) -> Button:
+	var chip := ArkTheme.choice(label, section == file_type, func() -> void:
+		file_type = section
+		for child in type_box.get_children():
+			ArkTheme.paint_choice(child as Button, str(child.get_meta("section", "")) == file_type)
+		_paint_stage_files()
+	)
+	chip.set_meta("section", section)
+	return chip
 
 
 func _on_file_filter() -> void:
 	if _stage_lock:
 		return
-	stage_shown = STAGE_PAGE
-	if stage_scroll != null:
-		stage_scroll.scroll_vertical = 0
 	_paint_stage_files()
 
 
-func _stage_name_pressed(event: InputEvent, box: CheckBox) -> void:
-	if event is InputEventMouseButton:
-		var mouse := event as InputEventMouseButton
-		if mouse.pressed and mouse.button_index == MOUSE_BUTTON_LEFT:
-			box.button_pressed = not box.button_pressed
+func _paint_file_titles() -> void:
+	var titles := {FILE_COL_NAME: "Name", FILE_COL_FORMAT: "Format", FILE_COL_SIZE: "Size", FILE_COL_STATE: ""}
+	var keys := {FILE_COL_NAME: "name", FILE_COL_FORMAT: "format", FILE_COL_SIZE: "size"}
+	for col in titles:
+		var text := str(titles[col])
+		if keys.get(col, "") == file_sort:
+			text += "  ↓" if file_sort_desc else "  ↑"
+		file_tree.set_column_title(col, text)
 
 
-# Filenames are one long token. A zero-width space after these marks lets the
-# label wrap at a path or word boundary instead of mid-letter.
-func _stage_break_name(name: String) -> String:
-	var out := ""
-	for i in name.length():
-		var ch := name.substr(i, 1)
-		out += ch
-		if ch == "_" or ch == "/" or ch == "-":
-			out += "\u200b"
-	return out
+func _on_file_sort(column: int, _mouse_button: int) -> void:
+	var keys := {FILE_COL_NAME: "name", FILE_COL_FORMAT: "format", FILE_COL_SIZE: "size"}
+	if not keys.has(column):
+		return
+	var next := str(keys[column])
+	if next == file_sort:
+		file_sort_desc = not file_sort_desc
+	else:
+		file_sort = next
+		file_sort_desc = next == "size"
+	_paint_file_titles()
+	_paint_stage_files()
 
 
-func _stage_toggled(on: bool, index: int) -> void:
-	picked[index] = on
+## Rebuilds the table from stage_files, the filter, the type chip and the sort.
+## picked stays keyed by stage_files index, so a filter never loses a tick.
+func _paint_stage_files() -> void:
+	file_tree.clear()
+	var root := file_tree.create_item()
+	var needle := file_filter.text.strip_edges().to_lower()
+	var matched: Array = []
+	for index in stage_files.size():
+		var file: Dictionary = stage_files[index]
+		if not file_type.is_empty() and Archive.file_section(file) != file_type:
+			continue
+		if not needle.is_empty() and str(file.get("name", "")).to_lower().find(needle) < 0:
+			continue
+		matched.append(index)
+	if file_sort == "name":
+		matched.sort_custom(func(a: int, b: int) -> bool:
+			return str(stage_files[a].get("name", "")).get_file().nocasecmp_to(str(stage_files[b].get("name", "")).get_file()) < 0
+		)
+	elif file_sort == "size":
+		matched.sort_custom(func(a: int, b: int) -> bool:
+			return Ark.file_bytes(stage_files[a]) < Ark.file_bytes(stage_files[b])
+		)
+	if file_sort_desc:
+		matched.reverse()
+	_shown_files = matched
+	var identifier := str(item.get("identifier", ""))
+	var from_chain := bool(item.get("from_chain", false))
+	for at in matched:
+		var file: Dictionary = stage_files[at]
+		var name := str(file.get("name", ""))
+		var row := file_tree.create_item(root)
+		row.set_cell_mode(FILE_COL_NAME, TreeItem.CELL_MODE_CHECK)
+		row.set_editable(FILE_COL_NAME, true)
+		row.set_checked(FILE_COL_NAME, bool(picked.get(at, false)))
+		row.set_text(FILE_COL_NAME, name)
+		row.set_tooltip_text(FILE_COL_NAME, name)
+		row.set_metadata(FILE_COL_NAME, at)
+		row.set_text(FILE_COL_FORMAT, Archive.file_section(file))
+		row.set_custom_color(FILE_COL_FORMAT, ArkTheme.SEA)
+		row.set_tooltip_text(FILE_COL_FORMAT, Archive.file_section(file))
+		row.set_text(FILE_COL_SIZE, _human_bytes(Ark.file_bytes(file)))
+		row.set_text_alignment(FILE_COL_SIZE, HORIZONTAL_ALIGNMENT_RIGHT)
+		row.set_custom_color(FILE_COL_SIZE, ArkTheme.SEA)
+		if from_chain:
+			row.set_text(FILE_COL_STATE, "aboard")
+			row.set_custom_color(FILE_COL_STATE, ArkTheme.LAMP)
+		elif not cache.sha_for(identifier, name).is_empty():
+			row.set_text(FILE_COL_STATE, "cached")
+			row.set_custom_color(FILE_COL_STATE, ArkTheme.WATER)
+			row.set_tooltip_text(FILE_COL_STATE, "Already on this machine. OPEN is instant.")
+	files_empty.visible = matched.is_empty()
+	if stage_files.is_empty():
+		files_empty.text = "This item lists no original files.\nTurn on Derivatives to see what the Archive generated." if not show_all else "This item lists no files."
+	else:
+		files_empty.text = "No files match this filter."
+	_paint_stage_note()
+
+
+func _on_file_edited() -> void:
+	var row := file_tree.get_edited()
+	if row == null:
+		return
+	picked[int(row.get_metadata(FILE_COL_NAME))] = row.is_checked(FILE_COL_NAME)
 	_paint_stage_note()
 	_quote()
 
 
-func _paint_stage_files() -> void:
-	var keep := 0
-	if stage_scroll != null:
-		keep = stage_scroll.scroll_vertical
-	for child in stage_list.get_children():
-		# MORE calls this while its own pressed signal is still running.
-		stage_list.remove_child(child)
-		child.queue_free()
-	boxes.clear()
-	var needle := ""
-	if file_filter != null:
-		needle = file_filter.text.strip_edges().to_lower()
-	var matched: Array = []
-	for index in stage_files.size():
-		var listed := str((stage_files[index] as Dictionary).get("name", ""))
-		if needle.is_empty() or listed.to_lower().find(needle) >= 0:
-			matched.append(index)
-	var limit := matched.size()
-	if limit > STAGE_PAGE:
-		limit = mini(stage_shown, limit)
-	var section_counts := {}
-	for listed_index in matched:
-		var counted: Dictionary = stage_files[int(listed_index)]
-		var key := Archive.file_section(counted)
-		section_counts[key] = int(section_counts.get(key, 0)) + 1
-	var last_section := ""
-	var last_folder := ""
-	for n in limit:
-		var at := int(matched[n])
-		var file: Dictionary = stage_files[at]
-		var name := str(file.get("name", ""))
-		var section := Archive.file_section(file)
-		var folder := Archive.file_folder(name)
-		if section != last_section:
-			var heading := Label.new()
-			heading.text = "%s    %s" % [section, Archive.grouped(int(section_counts.get(section, 0)))]
-			heading.autowrap_mode = TextServer.AUTOWRAP_OFF
-			heading.clip_text = true
-			heading.mouse_filter = Control.MOUSE_FILTER_IGNORE
-			heading.add_theme_font_size_override("font_size", ArkTheme.SIZE_SMALL)
-			heading.add_theme_color_override("font_color", ArkTheme.GOLD)
-			stage_list.add_child(heading)
-			last_section = section
-			last_folder = ""
-		if folder != last_folder and not folder.is_empty():
-			var folder_label := Label.new()
-			folder_label.text = folder
-			folder_label.autowrap_mode = TextServer.AUTOWRAP_OFF
-			folder_label.clip_text = true
-			folder_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-			folder_label.tooltip_text = folder
-			folder_label.add_theme_font_size_override("font_size", ArkTheme.SIZE_SMALL)
-			folder_label.add_theme_color_override("font_color", ArkTheme.WATER)
-			stage_list.add_child(folder_label)
-		last_folder = folder
-		var shown := name.get_file() if not folder.is_empty() else name
-		var row := VBoxContainer.new()
-		row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		row.add_theme_constant_override("separation", 1)
-		var head := HBoxContainer.new()
-		head.add_theme_constant_override("separation", 8)
-		head.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		var box := CheckBox.new()
-		box.focus_mode = Control.FOCUS_NONE
-		box.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-		box.button_pressed = bool(picked.get(at, false))
-		box.toggled.connect(_stage_toggled.bind(at))
-		box.set_meta("file", file)
-		head.add_child(box)
-		var size_label := Label.new()
-		size_label.text = _human_bytes(Ark.file_bytes(file))
-		size_label.autowrap_mode = TextServer.AUTOWRAP_OFF
-		size_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		size_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-		size_label.add_theme_font_size_override("font_size", ArkTheme.SIZE_SMALL)
-		size_label.add_theme_color_override("font_color", ArkTheme.SEA)
-		size_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-		size_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		size_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		head.add_child(size_label)
-		row.add_child(head)
-		var name_label := Label.new()
-		name_label.text = _stage_break_name(shown)
-		name_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		name_label.max_lines_visible = 3
-		name_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-		name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		name_label.add_theme_font_size_override("font_size", ArkTheme.SIZE_BODY)
-		name_label.add_theme_color_override("font_color", ArkTheme.PARCHMENT)
-		name_label.tooltip_text = name
-		name_label.gui_input.connect(_stage_name_pressed.bind(box))
-		row.add_child(name_label)
-		stage_list.add_child(row)
-		boxes.append(box)
-	if limit < matched.size():
-		var more := ArkTheme.quiet_button("MORE", _stage_more)
-		stage_list.add_child(more)
-	_paint_stage_note(matched.size(), limit)
-	if stage_scroll != null and needle.is_empty():
-		stage_scroll.scroll_vertical = keep
+func _on_file_activated() -> void:
+	var row := file_tree.get_selected()
+	if row == null or busy:
+		return
+	var at := int(row.get_metadata(FILE_COL_NAME))
+	if at < 0 or at >= stage_files.size():
+		return
+	busy = true
+	await _open_file(stage_files[at])
+	busy = false
+	_refresh_cache()
 
 
-func _stage_more() -> void:
-	stage_shown += STAGE_PAGE
-	_paint_stage_files()
+func _select_shown(on: bool) -> void:
+	for at in _shown_files:
+		picked[at] = on
+	_sync_ticks()
 
 
-func _paint_stage_note(matched: int = -1, shown: int = -1) -> void:
+func _select_none() -> void:
+	for at in picked:
+		picked[at] = false
+	_sync_ticks()
+
+
+func _sync_ticks() -> void:
+	var root := file_tree.get_root()
+	if root != null:
+		for row in root.get_children():
+			row.set_checked(FILE_COL_NAME, bool(picked.get(int(row.get_metadata(FILE_COL_NAME)), false)))
+	_paint_stage_note()
+	_quote()
+
+
+func _paint_stage_note() -> void:
 	if stage_note == null:
 		return
-	if stage_files.is_empty():
-		stage_note.visible = false
-		stage_note.text = ""
-		return
-	if matched < 0:
-		matched = stage_files.size()
-		shown = mini(stage_shown, matched)
-	var selected := _selected_files().size()
-	var text := "Showing %s of %s" % [Archive.grouped(shown), Archive.grouped(matched)]
-	if file_filter != null and not file_filter.text.strip_edges().is_empty():
-		text += " matches"
-	text += ". %s selected." % Archive.grouped(selected)
+	var chosen := _selected_files()
+	var raw := 0
+	for file in chosen:
+		raw += Ark.file_bytes(file)
+	if chosen.is_empty():
+		select_note.text = "Nothing selected"
+		select_note.add_theme_color_override("font_color", ArkTheme.SEA)
+	else:
+		select_note.text = "%s file%s · %s" % [
+			Archive.grouped(chosen.size()),
+			"" if chosen.size() == 1 else "s",
+			_human_bytes(raw),
+		]
+		select_note.add_theme_color_override("font_color", ArkTheme.FOAM)
+	var text := "of %s" % Archive.grouped(stage_files.size())
+	if _shown_files.size() != stage_files.size():
+		text += " · %s shown" % Archive.grouped(_shown_files.size())
 	stage_note.text = text
-	var filtering := file_filter != null and not file_filter.text.strip_edges().is_empty()
-	stage_note.visible = stage_files.size() > STAGE_PAGE or filtering
+	_sync_actions()
 
 
 func _selected_files() -> Array:
@@ -1039,7 +1518,9 @@ func _quote() -> void:
 			raws.append(Ark.part_raw(size, part))
 		index += 1
 	if raws.is_empty():
-		quote_label.text = "Nothing selected."
+		quote_label.text = "Tick files for a fee estimate"
+		quote_label.add_theme_color_override("font_color", ArkTheme.SEA)
+		quote_others.text = ""
 		sol_note.visible = false
 		return
 	var spec := {
@@ -1055,11 +1536,13 @@ func _quote() -> void:
 		var ident := str(item.get("identifier", ""))
 		if not Ark.row_has_id(_kind_rows, Ark.member_id(slug, ident)):
 			spec["kind_member_rows"] = [Ark.kind_member_row(slug, str(active.get("title", slug)), ident)]
-	quote_label.text = "%s    %s    %s" % [
-		Costs.amount("mon", Costs.quote_item("mon", spec)),
-		Costs.amount("sol", Costs.quote_item("sol", spec)),
-		Costs.amount("rh", Costs.quote_item("rh", spec)),
-	]
+	quote_label.text = "%s  on %s" % [Costs.amount(chain, Costs.quote_item(chain, spec)), CHAIN_NAMES[chain]]
+	quote_label.add_theme_color_override("font_color", ArkTheme.GOLD)
+	var others := PackedStringArray()
+	for code in CHAINS:
+		if code != chain:
+			others.append("%s %s" % [code.to_upper(), Costs.amount(code, Costs.quote_item(code, spec))])
+	quote_others.text = "Elsewhere: " + "   ".join(others)
 	sol_note.visible = chain == "sol"
 
 
@@ -1183,7 +1666,7 @@ func _cache_sibling(file: Dictionary, video_sha: String, identifier: String) -> 
 func _launch(sha: String, name: String) -> bool:
 	var absolute := cache.absolute_of(sha)
 	var kind := Archive.open_kind(name)
-	_show_preview(kind, absolute)
+	_show_preview(kind, absolute, name)
 	if kind == "folder":
 		OS.shell_show_in_file_manager(absolute)
 		_status("No player for this file. Showing it in the folder.")
@@ -1197,7 +1680,7 @@ func _launch(sha: String, name: String) -> bool:
 	return true
 
 
-func _show_preview(kind: String, absolute: String) -> void:
+func _show_preview(kind: String, absolute: String, name: String = "") -> void:
 	picture.visible = false
 	preview.visible = false
 	if kind == "image":
@@ -1211,6 +1694,8 @@ func _show_preview(kind: String, absolute: String) -> void:
 			preview.text = file.get_as_text()
 			preview.visible = true
 			file.close()
+	preview_title.text = "PREVIEW  " + name.get_file()
+	preview_box.visible = picture.visible or preview.visible
 
 
 func _inscribe_checked() -> void:
@@ -1357,18 +1842,30 @@ func _paint_aboard() -> void:
 			ident = str(row.get("id", "")).strip_edges()
 		if not ident.is_empty():
 			_aboard_ids[ident] = true
+	if tab_buttons.size() > 1:
+		tab_buttons[1].text = "ABOARD  %s" % Archive.grouped(_aboard_ids.size()) if not _aboard_ids.is_empty() else "ABOARD"
 	var query := aboard_filter.text if aboard_filter != null else ""
 	var groups := Ark.aboard_filter(Ark.aboard_groups(_manifest, _kind_rows), query)
 	if groups.is_empty():
-		if not query.is_empty():
-			var empty := ArkTheme.line("Nothing in the cabinet matches.", ArkTheme.MUTED, ArkTheme.SIZE_SMALL)
-			empty.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-			aboard_box.add_child(empty)
+		var empty := ArkTheme.line(
+			"Nothing in the cabinet matches." if not query.is_empty()
+			else "Nothing aboard yet.\nInscribe an item and it lands here.",
+			ArkTheme.SEA,
+			ArkTheme.SIZE_SMALL
+		)
+		empty.custom_minimum_size = Vector2(0, 120)
+		empty.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		aboard_box.add_child(empty)
 		return
+	var first := true
 	for group in groups:
-		var heading := ArkTheme.line(str(group.get("heading", "")), ArkTheme.WATER, ArkTheme.SIZE_SMALL)
-		heading.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-		aboard_box.add_child(heading)
+		var heading := ArkTheme.cell(str(group.get("heading", "")).to_upper(), ArkTheme.GOLD, ArkTheme.SIZE_SMALL)
+		var gap := MarginContainer.new()
+		gap.add_theme_constant_override("margin_top", 0 if first else 14)
+		gap.add_theme_constant_override("margin_bottom", 4)
+		gap.add_child(heading)
+		aboard_box.add_child(gap)
+		first = false
 		var items: Array = group.get("items", [])
 		var key := str(group.get("key", ""))
 		var window := Ark.aboard_page(items, int(_aboard_page.get(key, 1)))
@@ -1399,36 +1896,33 @@ func _aboard_turn(key: String, delta: int) -> void:
 
 
 func _aboard_row(entry: Dictionary) -> Control:
-	var panel := PanelContainer.new()
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	var idle := _row_box(false)
-	var hot := _row_box(true)
-	panel.add_theme_stylebox_override("panel", idle)
-	panel.mouse_entered.connect(func() -> void:
-		panel.add_theme_stylebox_override("panel", hot)
-	)
-	panel.mouse_exited.connect(func() -> void:
-		panel.add_theme_stylebox_override("panel", idle)
-	)
-	panel.gui_input.connect(func(event: InputEvent) -> void:
-		if event is InputEventMouseButton:
-			var mouse := event as InputEventMouseButton
-			if mouse.pressed and mouse.button_index == MOUSE_BUTTON_LEFT:
-				panel.accept_event()
-				await _open_aboard(entry)
-	)
+	var ident := str(entry.get("identifier", ""))
+	var panel := _clickable_row(ident, func() -> void: await _open_aboard(entry))
+	var row := HBoxContainer.new()
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_theme_constant_override("separation", 10)
+	panel.add_child(row)
 	var words := VBoxContainer.new()
 	words.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	words.add_theme_constant_override("separation", 0)
-	panel.add_child(words)
-	words.add_child(ArkTheme.cell(str(entry.get("title", "")), ArkTheme.PARCHMENT, ArkTheme.SIZE_SMALL))
+	words.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	words.add_theme_constant_override("separation", 2)
+	row.add_child(words)
+	var title := ArkTheme.cell(str(entry.get("title", "")), ArkTheme.PARCHMENT, ArkTheme.SIZE_BODY)
+	title.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	words.add_child(title)
+	var parts := PackedStringArray([ident])
+	var kind := Archive.mediatype_label(str(entry.get("mediatype", "")))
+	if not kind.is_empty():
+		parts.append(kind)
+	var bytes := int(str(entry.get("bytes", "0")))
+	if bytes > 0:
+		parts.append(_human_bytes(bytes))
+	var sub := ArkTheme.cell(" · ".join(parts), ArkTheme.SEA, ArkTheme.SIZE_SMALL)
+	sub.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	words.add_child(sub)
 	var aboard := bool(entry.get("aboard", false))
-	var mark := "aboard" if aboard else "not yet aboard"
-	words.add_child(ArkTheme.cell(
-		"%s   %s" % [str(entry.get("identifier", "")), mark],
-		ArkTheme.LAMP if aboard else ArkTheme.SEA
-	))
+	var tag := ArkTheme.badge("ABOARD" if aboard else "NOT YET", ArkTheme.LAMP if aboard else ArkTheme.SEA)
+	row.add_child(tag)
 	return panel
 
 
@@ -1459,7 +1953,7 @@ func _open_aboard(entry: Dictionary) -> void:
 		"collections": [],
 	}
 	_fill_stage()
-	_status("Aboard %s. %d files. OPEN reads them back." % [ident, boxes.size()])
+	_status("Aboard %s. %d files. OPEN reads them back." % [ident, stage_files.size()])
 
 
 func _repair_aboard() -> void:
@@ -1519,10 +2013,8 @@ func _paint_featured(band: Array, kinds: Array) -> void:
 		featured_box.add_child(_featured_chip(label, title, ia, slug))
 
 
-func _toggle_derivatives() -> void:
-	show_all = not show_all
-	if show_button != null:
-		show_button.text = "ORIGINALS" if show_all else "SHOW ALL"
+func _toggle_derivatives(on: bool) -> void:
+	show_all = on
 	if not item.is_empty():
 		_fill_stage()
 
@@ -1566,8 +2058,9 @@ func _paint_kind() -> void:
 		sort_box.visible = false
 	var members := Ark.kind_members(_kind_rows, kind_slug)
 	count_label.text = "%d on this shelf" % members.size()
-	pager_prev.disabled = true
-	pager_next.disabled = true
+	pager_prev.visible = false
+	pager_next.visible = false
+	page_label.visible = false
 	empty_label.visible = members.is_empty()
 	empty_label.text = "This shelf is empty. Add an identifier."
 	results_scroll.visible = not members.is_empty()
@@ -1944,6 +2437,21 @@ func _clear_all() -> void:
 
 func _refresh_cache() -> void:
 	cache_label.text = "CACHE  %s" % _human_bytes(cache.total_bytes())
+	_paint_file_states()
+
+
+## The state column only. A full repaint would drop the scroll position.
+func _paint_file_states() -> void:
+	if file_tree == null or file_tree.get_root() == null or bool(item.get("from_chain", false)):
+		return
+	var identifier := str(item.get("identifier", ""))
+	for row in file_tree.get_root().get_children():
+		var at := int(row.get_metadata(FILE_COL_NAME))
+		var name := str((stage_files[at] as Dictionary).get("name", ""))
+		var cached := not cache.sha_for(identifier, name).is_empty()
+		row.set_text(FILE_COL_STATE, "cached" if cached else "")
+		row.set_custom_color(FILE_COL_STATE, ArkTheme.WATER)
+		row.set_tooltip_text(FILE_COL_STATE, "Already on this machine. OPEN is instant." if cached else "")
 
 
 func _on_progress(received: int) -> void:
