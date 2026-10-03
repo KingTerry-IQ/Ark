@@ -1,0 +1,46 @@
+{
+  "item_size": 1020,
+  "metadata": {
+    "identifier": "TerryDavislosethosChannel",
+    "title": "YouTube Archive: Terry A. Davis' old channel (losethos)",
+    "mediatype": "movies",
+    "creator": "Terry A. Davis",
+    "date": "2017",
+    "collection": ["community", "opensource"],
+    "description": "A channel dump."
+  },
+  "files": [
+    {
+      "name": "talk.mp4",
+      "source": "original",
+      "format": "h.264",
+      "size": "1000",
+      "md5": "abc",
+      "sha1": "def"
+    },
+    {
+      "name": "talk.en.vtt",
+      "source": "original",
+      "format": "SubRip",
+      "size": "20"
+    },
+    {
+      "name": "TerryDavislosethosChannel_meta.xml",
+      "source": "original",
+      "format": "Metadata",
+      "size": "10"
+    },
+    {
+      "name": "__ia_thumb.jpg",
+      "source": "original",
+      "format": "JPEG Thumb",
+      "size": "5"
+    },
+    {
+      "name": "talk.ia.mp4",
+      "source": "derivative",
+      "format": "h.264",
+      "size": "800"
+    }
+  ]
+}

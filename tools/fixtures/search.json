@@ -1,0 +1,17 @@
+{
+  "response": {
+    "numFound": 2,
+    "docs": [
+      {
+        "identifier": "prelinger",
+        "title": "Prelinger Archives",
+        "mediatype": "collection"
+      },
+      {
+        "identifier": "nasa",
+        "title": "NASA",
+        "mediatype": "collection"
+      }
+    ]
+  }
+}
