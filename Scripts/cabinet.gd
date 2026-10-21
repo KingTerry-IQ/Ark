@@ -50,8 +50,8 @@ func kind_rows(error: Array = []) -> Array:
 	return await space.read_rows(Ark.KINDS_TABLE, 2000, error)
 
 
-func item_rows(identifier: String) -> Array:
-	return await space.read_rows(Ark.table_name(identifier), 5000)
+func item_rows(identifier: String, error: Array = []) -> Array:
+	return await space.read_rows(Ark.table_name(identifier), 5000, error)
 
 
 ## The header is written once. A later call with the same slug adds nothing.
@@ -85,7 +85,8 @@ func add_member(slug: String, title: String, identifier: String) -> bool:
 
 
 ## Append a featured or done mark. A duplicate id retries with the clock moved.
-func write_mark(slug: String, title: String, state: String) -> bool:
+## `note` is the Archive item count when a collection is featured.
+func write_mark(slug: String, title: String, state: String, note: String = "") -> bool:
 	last_error = ""
 	if state != "featured" and state != "done":
 		last_error = "A mark is featured or done."
@@ -99,7 +100,7 @@ func write_mark(slug: String, title: String, state: String) -> bool:
 	var rows: Array = await kind_rows()
 	var ms := int(Time.get_unix_time_from_system() * 1000.0)
 	for _attempt in 4:
-		var row := Ark.mark_row(slug, title, ms, state)
+		var row := Ark.mark_row(slug, title, ms, state, note)
 		if not Ark.row_has_id(rows, str(row.get("id", ""))):
 			return await _write(Ark.KINDS_TABLE, row)
 		ms += 1
@@ -113,10 +114,13 @@ func published() -> void:
 
 ## File rows of one item, oldest index first. Each record carries the chain
 ## sha256 so a read-back can refuse a mismatched reassembly.
-func file_list(identifier: String) -> Array:
+func file_list(identifier: String, progress: Callable = Callable()) -> Array:
 	last_error = ""
 	var table := Ark.table_name(identifier)
-	var rows: Array = await space.read_rows(table, 5000)
+	var rows: Array = await space.read_rows(table, 5000, [], progress)
+	var finished := {}
+	for name in Ark.complete_file_names(rows):
+		finished[name] = true
 	var out: Array = []
 	var seen := {}
 	for row in rows:
@@ -140,6 +144,7 @@ func file_list(identifier: String) -> Array:
 			"source": str(header.get("source", "original")),
 			"mtime": str(header.get("mtime", "")),
 			"index": _file_index(str(row.get("id", ""))),
+			"aboard": bool(finished.get(name, false)),
 		})
 	out.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
 		return int(a.get("index", 0)) < int(b.get("index", 0))
@@ -149,12 +154,27 @@ func file_list(identifier: String) -> Array:
 	return out
 
 
+## File names on this item whose blob parts are all present.
+func aboard_names(identifier: String, progress: Callable = Callable()) -> PackedStringArray:
+	last_error = ""
+	var problem: Array = []
+	var rows: Array = await space.read_rows(Ark.table_name(identifier), 5000, problem, progress)
+	if rows.is_empty() and not problem.is_empty():
+		last_error = str(problem[0])
+	return Ark.complete_file_names(rows)
+
+
 ## Write every blob part of `filename` to `dest`, in order. The file stays
 ## only when its sha256 matches the file row. A gap or a mismatch deletes it.
-func reassemble(identifier: String, filename: String, dest: String) -> Dictionary:
+func reassemble(
+	identifier: String,
+	filename: String,
+	dest: String,
+	progress: Callable = Callable()
+) -> Dictionary:
 	last_error = ""
 	var table := Ark.table_name(identifier)
-	var rows: Array = await space.read_rows(table, 5000)
+	var rows: Array = await space.read_rows(table, 5000, [], progress)
 	var header := {}
 	var blobs := {}
 	for row in rows:
@@ -251,13 +271,15 @@ func repair() -> int:
 
 
 ## `files` are Archive file records. `paths` maps each file name to a local
-## path. `status` receives a short sentence. Returns false with last_error set.
+## path. `status` receives a short sentence. `progress` receives 0-100 across
+## the chain writes. Returns false with last_error set.
 func inscribe(
 	item: Dictionary,
 	files: Array,
 	paths: Dictionary,
 	status: Callable = Callable(),
-	kinds: Array = []
+	kinds: Array = [],
+	progress: Callable = Callable()
 ) -> bool:
 	last_error = ""
 	var identifier := str(item.get("identifier", "")).strip_edges()
@@ -300,7 +322,9 @@ func inscribe(
 		return false
 
 	var table := Ark.table_name(identifier)
-	if not await space.table_exists(table):
+	_say(status, "Reading what is already aboard.")
+	var creating: bool = not await space.table_exists(table)
+	if creating:
 		_say(status, "Opening a table anyone can continue.")
 		var created: Variant = await _create(table, PackedStringArray(Ark.ITEM_COLUMNS), Callable())
 		if created == null:
@@ -313,25 +337,30 @@ func inscribe(
 	var have := {}
 	var by_name := {}
 	var max_index := -1
-	# One page. Past 5000 rows an EVM read cannot ask for the rest.
-	var existing: Array = await space.read_rows(table, 5000)
-	for row in existing:
-		if not row is Dictionary:
-			continue
-		var id := str((row as Dictionary).get("id", ""))
-		have[id] = true
-		var index := _file_index(id)
-		if index < 0:
-			continue
-		max_index = maxi(max_index, index)
-		var named := str((row as Dictionary).get("name", ""))
-		if not named.is_empty() and not by_name.has(named):
-			by_name[named] = index
+	if not creating:
+		# One page. Past 5000 rows an EVM read cannot ask for the rest.
+		var existing: Array = await space.read_rows(table, 5000)
+		for row in existing:
+			if not row is Dictionary:
+				continue
+			var id := str((row as Dictionary).get("id", ""))
+			have[id] = true
+			var index := _file_index(id)
+			if index < 0:
+				continue
+			max_index = maxi(max_index, index)
+			var named := str((row as Dictionary).get("name", ""))
+			if not named.is_empty() and not by_name.has(named):
+				by_name[named] = index
 
+	var ops: Array = []
 	if not bool(have.get(Ark.META_ID, false)):
-		_say(status, "Writing the card for %s" % identifier)
-		if not await _write(table, Ark.card_row(item)):
-			return false
+		ops.append({
+			"op": "row",
+			"table": table,
+			"row": Ark.card_row(item),
+			"note": "Writing the card for %s" % identifier,
+		})
 		have[Ark.META_ID] = true
 
 	for entry in prepared:
@@ -346,37 +375,83 @@ func inscribe(
 		if not bool(have.get(file_id, false)):
 			var recorded: Dictionary = (entry["file"] as Dictionary).duplicate()
 			recorded["size"] = str(length)
-			_say(status, "Writing %s" % name)
-			if not await _write(table, Ark.file_row(identifier, index, recorded, str(entry["sha"]), parts)):
-				return false
+			ops.append({
+				"op": "row",
+				"table": table,
+				"row": Ark.file_row(identifier, index, recorded, str(entry["sha"]), parts),
+				"note": "Writing %s" % name,
+			})
 			have[file_id] = true
 		var missing: Array = Ark.missing_parts(index, parts, have)
 		for part in missing:
-			_say(status, "Writing %s  part %d of %d" % [name, int(part) + 1, parts])
 			var payload := _part_b64(str(entry["path"]), int(part), length)
 			if payload.is_empty() and Ark.part_raw(length, int(part)) > 0:
 				last_error = "Could not read part %d of %s." % [int(part), name]
 				return false
-			var blob := Ark.blob_row(index, int(part), parts, str(entry["sha"]), Ark.part_raw(length, int(part)), payload)
-			if not await _write(table, blob):
-				return false
+			ops.append({
+				"op": "row",
+				"table": table,
+				"row": Ark.blob_row(
+					index,
+					int(part),
+					parts,
+					str(entry["sha"]),
+					Ark.part_raw(length, int(part)),
+					payload
+				),
+				"note": "Writing %s  part %d of %d" % [name, int(part) + 1, parts],
+			})
 			have[Ark.blob_id(index, int(part))] = true
-
-	if not await _manifest_has(identifier):
-		_say(status, "Adding %s to the manifest." % identifier)
-		if not await _write(Ark.MANIFEST_TABLE, Ark.manifest_row(item, raw_total)):
-			return false
+	ops.append({"op": "manifest"})
 	for kind in kinds:
 		if not kind is Dictionary:
 			continue
-		var slug := str(kind.get("slug", "")).strip_edges()
-		var title := str(kind.get("title", slug))
-		if slug.is_empty():
+		if str(kind.get("slug", "")).strip_edges().is_empty():
 			continue
-		_say(status, "Filing %s on %s." % [identifier, title])
-		if not await add_member(slug, title, identifier):
-			return false
+		ops.append({"op": "kind", "kind": kind})
+
+	# A lambda copies an int. The dictionary is shared, so each finished write
+	# moves the fraction instead of leaving it on the first step.
+	var pace := {"done": 1 if creating else 0}
+	var total := ops.size() + int(pace["done"])
+	var pulse := func(local: float) -> void:
+		if not progress.is_valid() or total <= 0:
+			return
+		var blended := (float(pace["done"]) + local / 100.0) / float(total) * 100.0
+		progress.call(clampf(blended, 0.0, 100.0))
+	pulse.call(0.0)
+
+	for op in ops:
+		var op_name := str(op.get("op", ""))
+		var note := str(op.get("note", ""))
+		if not note.is_empty():
+			_say(status, note)
+		var on_part := func(p: Variant) -> void:
+			pulse.call(float(p))
+		if op_name == "row":
+			var record: Dictionary = op.get("row", {})
+			if not await _write(str(op.get("table", "")), record, on_part):
+				return false
+		elif op_name == "manifest":
+			_say(status, "Checking the manifest.")
+			var on_chain := await _manifest_has(identifier, on_part)
+			if not on_chain:
+				_say(status, "Adding %s to the manifest." % identifier)
+				if not await _write(Ark.MANIFEST_TABLE, Ark.manifest_row(item, raw_total), on_part):
+					return false
+		elif op_name == "kind":
+			var shelf: Dictionary = op.get("kind", {})
+			var slug := str(shelf.get("slug", "")).strip_edges()
+			var title := str(shelf.get("title", slug))
+			_say(status, "Filing %s on %s." % [identifier, title])
+			if not await add_member(slug, title, identifier):
+				return false
+		pace["done"] = int(pace["done"]) + 1
+		pulse.call(0.0)
+
 	_say(status, "Aboard: %s" % identifier)
+	if progress.is_valid():
+		progress.call(100.0)
 	return true
 
 
@@ -397,16 +472,16 @@ func _create(name: String, columns: PackedStringArray, progress: Callable) -> Va
 	return created
 
 
-func _write(name: String, row: Dictionary) -> bool:
-	var wrote: Variant = await space.write_row(name, row, Callable())
+func _write(name: String, row: Dictionary, progress: Callable = Callable()) -> bool:
+	var wrote: Variant = await space.write_row(name, row, progress)
 	if wrote == null:
 		last_error = str(space.last_error)
 		return false
 	return true
 
 
-func _manifest_has(identifier: String) -> bool:
-	var rows: Array = await space.read_rows(Ark.MANIFEST_TABLE, 2000)
+func _manifest_has(identifier: String, progress: Callable = Callable()) -> bool:
+	var rows: Array = await space.read_rows(Ark.MANIFEST_TABLE, 2000, [], progress)
 	for row in rows:
 		if not row is Dictionary:
 			continue

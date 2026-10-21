@@ -227,10 +227,7 @@ func _wipe_dir(path: String) -> void:
 
 
 func _safe_name(filename: String) -> String:
-	var base := filename.get_file()
-	if base.is_empty():
-		return "file"
-	return base.replace(":", "_")
+	return Archive.local_name(filename)
 
 
 func _remove_path(path: String) -> void:

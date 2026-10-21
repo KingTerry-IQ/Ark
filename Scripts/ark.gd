@@ -337,13 +337,13 @@ static func kind_member_row(slug: String, title: String, identifier: String) -> 
 	}
 
 
-static func mark_row(slug: String, title: String, unix_ms: int, state: String) -> Dictionary:
+static func mark_row(slug: String, title: String, unix_ms: int, state: String, note: String = "") -> Dictionary:
 	return {
 		"id": mark_id(slug, unix_ms),
 		"title": title,
 		"ia": "",
 		"identifier": "",
-		"note": "",
+		"note": note,
 		"state": state,
 	}
 
@@ -369,12 +369,14 @@ static func latest_marks(rows: Array) -> Dictionary:
 				"state": state,
 				"id": id,
 				"title": str(row.get("title", "")),
+				"note": str(row.get("note", "")),
 			}
 	return best
 
 
 ## Featured efforts, oldest mark first. A later `done` drops the slug.
-## A later `featured` puts it back.
+## A later `featured` puts it back. `note` is the collection size when the
+## mark recorded one.
 static func featured_band(rows: Array) -> Array:
 	var marks := latest_marks(rows)
 	var band: Array = []
@@ -386,11 +388,156 @@ static func featured_band(rows: Array) -> Array:
 			"slug": slug,
 			"id": str(mark.get("id", "")),
 			"title": str(mark.get("title", "")),
+			"note": str(mark.get("note", "")),
 		})
 	band.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
-		return str(a.get("id", "")) < str(b.get("id", ""))
+		var a_id := str(a.get("id", ""))
+		var b_id := str(b.get("id", ""))
+		var a_at := _mark_time(a_id)
+		var b_at := _mark_time(b_id)
+		if a_at == b_at:
+			return a_id < b_id
+		return a_at < b_at
 	)
 	return band
+
+
+static func _mark_time(id: String) -> String:
+	var cut := id.find("/mark/")
+	if cut < 0:
+		return id
+	return id.substr(cut + 6)
+
+
+## A feature mark may carry the Archive's item count as its note.
+## A grouping's note is `f:` plus the original file count, which is not an item count.
+static func published_total(note: String) -> int:
+	var text := note.strip_edges()
+	if not text.is_valid_int():
+		return -1
+	var n := int(text)
+	if n <= 0:
+		return -1
+	return n
+
+
+## Original-file count stored on a grouping's feature mark.
+static func published_file_total(note: String) -> int:
+	var text := note.strip_edges()
+	if not text.begins_with("f:"):
+		return -1
+	return published_total(text.substr(2))
+
+
+## The one item a featured grouping stands for, such as the TempleOS channel
+## archive. A collection binding, and a shelf with any other number of
+## members, is not a grouping.
+static func item_effort_member(kinds: Array, slug: String) -> String:
+	if slug.strip_edges().is_empty():
+		return ""
+	if not str(kind_header(kinds, slug).get("ia", "")).strip_edges().is_empty():
+		return ""
+	var members := kind_members(kinds, slug)
+	if members.size() != 1:
+		return ""
+	return members[0]
+
+
+## The live Archive count wins, then a walk this machine has saved, then the
+## size written on the feature mark.
+static func known_total(published: int, walked: int, peeked: int) -> int:
+	if peeked > 0:
+		return peeked
+	if walked > 0:
+		return walked
+	if published > 0:
+		return published
+	return -1
+
+
+## Items aboard for one effort, from the manifest every client reads.
+## A bound collection uses `archive_total` as the whole collection. Until that
+## size is known the fraction stays open, so a few inscribed items are not
+## reported as a finished collection. A shelf with no collection id uses its
+## member list as the whole effort. Members that are aboard still count when
+## the collection list on the manifest row was clipped.
+static func effort_progress(
+	manifest: Array,
+	kinds: Array,
+	slug: String,
+	ia: String,
+	archive_total: int = -1
+) -> Dictionary:
+	var want := ia.strip_edges()
+	var aboard_of := {}
+	var seen_row := {}
+	for row in manifest:
+		if not row is Dictionary:
+			continue
+		var ident := str(row.get("identifier", "")).strip_edges()
+		if ident.is_empty():
+			ident = str(row.get("id", "")).strip_edges()
+		if ident.is_empty() or seen_row.has(ident):
+			continue
+		seen_row[ident] = true
+		if want.is_empty():
+			continue
+		if _split_collections(str(row.get("collections", ""))).has(want):
+			aboard_of[ident] = true
+	var members := kind_members(kinds, slug)
+	for ident in members:
+		if seen_row.has(ident):
+			aboard_of[ident] = true
+	var aboard := aboard_of.size()
+	var known := false
+	var total := 0
+	if archive_total > 0:
+		known = true
+		total = archive_total
+	elif not members.is_empty() and want.is_empty():
+		known = true
+		total = members.size()
+	if known and aboard > total:
+		total = aboard
+	return {"aboard": aboard, "total": total, "known": known}
+
+
+## One entry per featured effort, oldest mark first. `totals` maps a
+## collection id to the Archive's item count when this client knows it.
+## `files` maps a grouping slug to `{aboard, total, known}` for its original files.
+static func featured_views(
+	manifest: Array,
+	kinds: Array,
+	totals: Dictionary = {},
+	files: Dictionary = {}
+) -> Array:
+	var views: Array = []
+	for entry in featured_band(kinds):
+		var slug := str(entry.get("slug", ""))
+		var title := str(entry.get("title", "")).strip_edges()
+		if title.is_empty():
+			title = slug
+		var ia := str(kind_header(kinds, slug).get("ia", "")).strip_edges()
+		var archive_total := -1
+		if not ia.is_empty():
+			archive_total = int(totals.get(ia, -1))
+		var progress := effort_progress(manifest, kinds, slug, ia, archive_total)
+		var file_row: Dictionary = files.get(slug, {})
+		var files_known := bool(file_row.get("known", false))
+		var files_total := maxi(int(file_row.get("total", 0)), 0)
+		views.append({
+			"slug": slug,
+			"title": title,
+			"ia": ia,
+			"member": item_effort_member(kinds, slug),
+			"aboard": int(progress.get("aboard", 0)),
+			"total": int(progress.get("total", 0)),
+			"known": bool(progress.get("known", false)),
+			"files_aboard": int(file_row.get("aboard", 0)) if files_known else 0,
+			"files_total": files_total,
+			"files_known": files_known,
+		})
+	return views
 
 
 ## True only when the Archive answered and every member is fully aboard.
@@ -409,15 +556,18 @@ static func effort_is_complete(
 
 
 ## A finished walk writes `done` only when the Archive answered and every
-## member is fully aboard. A partial scrape, a gap, or a silent Archive stays
-## featured.
+## member is fully aboard. A partial scrape, a gap, a silent Archive, or a
+## collection larger than the members gathered stays featured.
 static func should_finish(
 	members: PackedStringArray,
 	complete: Dictionary,
 	archive_reachable: bool,
-	walk_finished: bool
+	walk_finished: bool,
+	archive_total: int = -1
 ) -> bool:
 	if not walk_finished:
+		return false
+	if archive_total > members.size():
 		return false
 	return effort_is_complete(members, complete, archive_reachable)
 
@@ -519,12 +669,15 @@ static func walk_add(
 	state: Dictionary,
 	identifiers: PackedStringArray,
 	cursor: String,
-	finished: bool
+	finished: bool,
+	total: int = -1
 ) -> Dictionary:
 	var next := state.duplicate(true)
 	next["members"] = merge_ids(next.get("members", []), identifiers)
 	next["cursor"] = cursor
 	next["finished"] = finished
+	if total > 0:
+		next["total"] = total
 	return next
 
 
@@ -554,29 +707,23 @@ static func load_walk(slug: String) -> Dictionary:
 	return got if got is Dictionary else {}
 
 
-## A file is aboard when its file row and every blob part are present.
-## Derivatives are not in `names`. A card with no originals is complete.
-static func file_tally(rows: Array, names: PackedStringArray) -> Dictionary:
+## Names whose file row and every blob part are on these rows.
+static func complete_file_names(rows: Array) -> PackedStringArray:
 	var have := {}
 	var by_name := {}
-	var meta := false
 	for row in rows:
 		if not row is Dictionary:
 			continue
 		var id := str(row.get("id", ""))
 		have[id] = true
-		if id == META_ID:
-			meta = true
 		if str(row.get("role", "")) != "file":
 			continue
 		var name := str(row.get("name", ""))
 		if name.is_empty() or by_name.has(name):
 			continue
 		by_name[name] = row
-	var aboard := 0
-	for name in names:
-		if not by_name.has(name):
-			continue
+	var out := PackedStringArray()
+	for name in by_name:
 		var header: Dictionary = by_name[name]
 		var index := _row_index(str(header.get("id", "")))
 		if index < 0:
@@ -588,12 +735,59 @@ static func file_tally(rows: Array, names: PackedStringArray) -> Dictionary:
 				whole = false
 				break
 		if whole:
+			out.append(str(name))
+	return out
+
+
+## A file is aboard when its file row and every blob part are present.
+## Derivatives are not in `names`. A card with no originals is complete.
+static func file_tally(rows: Array, names: PackedStringArray) -> Dictionary:
+	var finished := {}
+	for name in complete_file_names(rows):
+		finished[name] = true
+	var aboard := 0
+	for name in names:
+		if finished.has(name):
 			aboard += 1
+	var meta := false
+	for row in rows:
+		if row is Dictionary and str(row.get("id", "")) == META_ID:
+			meta = true
+			break
 	return {
 		"complete": meta and aboard == names.size(),
 		"aboard": aboard,
 		"total": names.size(),
 	}
+
+
+## Files aboard against the original count, without asking the Archive.
+##
+## When `names` is the Archive's original list, only those files count.
+## Otherwise every complete file on `rows` counts, and `published` is the
+## `f:` total written on the feature mark when the item was featured.
+## A missing denominator stays unknown, so an empty chain is not "0/0".
+static func grouping_files(
+	rows: Array,
+	published: int,
+	names: PackedStringArray = PackedStringArray()
+) -> Dictionary:
+	var aboard := 0
+	var total := 0
+	if not names.is_empty():
+		var tally := file_tally(rows, names)
+		aboard = int(tally.get("aboard", 0))
+		total = names.size()
+	else:
+		aboard = complete_file_names(rows).size()
+		total = published
+	if published > total:
+		total = published
+	if aboard > total:
+		total = aboard
+	if total <= 0:
+		return {"known": false, "aboard": 0, "total": 0}
+	return {"known": true, "aboard": aboard, "total": total}
 
 
 static func effort_label(
@@ -688,10 +882,13 @@ static func load_mirror(path: String) -> Array:
 	return got if got is Array else []
 
 
-## Kind shelves first, then Archive collections no kind has claimed, then
-## UNFILED. An item under several headings is listed under each. A kind with
-## no finished items stays, so its empty berths remain visible. Duplicate
-## manifest rows keep the first one in the array.
+## Kind shelves first, then UNFILED. An item under several shelves is listed
+## under each. A shelf bound to an Archive collection also lists manifest rows
+## that name that collection. Other collection tags stay on the manifest and
+## do not open a heading: archive.org stamps housekeeping ids such as
+## deemphasize and additional_collections_video on an upload, and those are
+## not shelves anyone filed. A shelf with no finished items stays, so its
+## empty berths remain visible. Duplicate manifest rows keep the first one.
 static func aboard_groups(manifest: Array, kinds: Array) -> Array:
 	var by_id := {}
 	var order: Array = []
@@ -750,31 +947,17 @@ static func aboard_groups(manifest: Array, kinds: Array) -> Array:
 			if bool((entry as Dictionary).get("aboard", false)):
 				placed[str((entry as Dictionary).get("identifier", ""))] = true
 
-	var coll_items := {}
-	var coll_order: Array = []
 	for ident in order:
 		var row: Dictionary = by_id[ident]
-		var collections := _split_collections(str(row.get("collections", "")))
-		if collections.is_empty():
-			continue
-		placed[ident] = true
-		for cid in collections:
-			if bound.has(cid):
-				var host: Dictionary = groups[int(bound[cid])]
-				_aboard_push(host, ident, row)
+		var filed := false
+		for cid in _split_collections(str(row.get("collections", ""))):
+			if not bound.has(cid):
 				continue
-			if not coll_items.has(cid):
-				coll_items[cid] = []
-				coll_order.append(cid)
-			_aboard_push_list(coll_items[cid], ident, row)
-	for cid in coll_order:
-		groups.append({
-			"key": "ia:" + cid,
-			"heading": cid,
-			"slug": "",
-			"ia": cid,
-			"items": coll_items[cid],
-		})
+			var host: Dictionary = groups[int(bound[cid])]
+			_aboard_push(host, ident, row)
+			filed = true
+		if filed:
+			placed[ident] = true
 
 	var unfiled: Array = []
 	for ident in order:

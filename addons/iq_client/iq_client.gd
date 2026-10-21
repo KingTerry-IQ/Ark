@@ -202,7 +202,9 @@ func _load_discovery_file() -> bool:
 
 
 func _confirm_health() -> bool:
-	var response: Dictionary = await _request("GET", "/health", {}, null, false)
+	# A missing host should fail quickly, so Ark can look again. A real call
+	# still waits as long as the user needs.
+	var response: Dictionary = await _request("GET", "/health", {}, null, false, 3.0)
 	if not response.get("ok", false):
 		last_error = "Host at %s is not answering." % base_url
 		return false
@@ -705,7 +707,8 @@ func _request(
 	path: String,
 	query: Dictionary = {},
 	body: Variant = null,
-	authenticated: bool = true
+	authenticated: bool = true,
+	timeout: float = 0.0
 ) -> Dictionary:
 	if base_url.is_empty():
 		last_error = "No host configured; call discover() first."
@@ -727,8 +730,9 @@ func _request(
 		body_text = JSON.stringify(body)
 
 	var http := HTTPRequest.new()
-	# A write can sit for minutes while the user decides, so never time out.
-	http.timeout = 0
+	# A write can sit for minutes while the user decides, so the default
+	# timeout is none. The health probe passes a short one.
+	http.timeout = timeout
 	add_child(http)
 
 	var verb := HTTPClient.METHOD_GET if method == "GET" else HTTPClient.METHOD_POST

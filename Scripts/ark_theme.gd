@@ -177,9 +177,11 @@ static func _style_bars(theme: Theme) -> void:
 
 
 static func _style_scroll(theme: Theme) -> void:
-	var track := _box(GOLD_DIM, INK, 1, 1, 1)
-	var grab := _box(GOLD, GOLD, 0, 0, 1)
-	var grab_hot := _box(FOAM, FOAM, 0, 0, 1)
+	# Wide enough to find and grab: a 14 px lit track, a gold thumb at least
+	# 32 px long on it.
+	var track := _box(GOLD_DIM, HULL_RAISED, 7, 7, 1)
+	var grab := _box(INK, GOLD, 6, 16, 1)
+	var grab_hot := _box(INK, FOAM, 6, 16, 1)
 	for kind in ["VScrollBar", "HScrollBar"]:
 		theme.set_stylebox("scroll", kind, track)
 		theme.set_stylebox("scroll_focus", kind, track)
@@ -459,6 +461,8 @@ static func paint_choice(b: Button, on: bool) -> void:
 	b.add_theme_stylebox_override("normal", _box(GOLD_DIM, INK, 8, 3, 1))
 	b.add_theme_stylebox_override("hover", _box(GOLD, INK, 8, 3, 1))
 	b.add_theme_stylebox_override("pressed", _solid(GOLD))
+	b.add_theme_stylebox_override("disabled", _box(Color(GOLD_DIM, 0.35), INK, 8, 3, 1))
+	b.add_theme_color_override("font_disabled_color", Color(SEA, 0.5))
 	b.add_theme_color_override("font_color", PARCHMENT)
 	b.add_theme_color_override("font_hover_color", GOLD)
 	b.add_theme_color_override("font_pressed_color", INK)

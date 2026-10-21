@@ -4,10 +4,17 @@
 class_name Fetch
 extends Node
 
+## A download has started. Each call gets its own number, so a late
+## end from a cancelled call can be told from the current one.
+signal began(job: int)
+## The full size, once the Archive says it. -1 when it does not.
+signal sized(total: int)
 signal progressed(received: int)
+signal ended(job: int)
 
 var last_error := ""
 var _job := 0
+var _calls := 0
 
 
 ## Drops the download in progress. The call that is waiting returns false.
@@ -16,8 +23,17 @@ func cancel() -> void:
 
 
 func download(url: String, dest: String) -> bool:
-	last_error = ""
 	var job := _job
+	_calls += 1
+	var call := _calls
+	began.emit(call)
+	var ok := await _download(url, dest, job)
+	ended.emit(call)
+	return ok
+
+
+func _download(url: String, dest: String, job: int) -> bool:
+	last_error = ""
 	# A cancelled call closes its file on the next frame. Wait, so this one
 	# does not reopen that path while the other handle is still up.
 	await get_tree().process_frame
@@ -84,6 +100,10 @@ func download(url: String, dest: String) -> bool:
 		if code == 206:
 			out.seek_end()
 		var received := have if code == 206 else 0
+		var length := int(_header(http.get_response_headers(), "content-length"))
+		sized.emit(received + length if length > 0 else -1)
+		if received > 0:
+			progressed.emit(received)
 		var last_byte := Time.get_ticks_msec()
 		while http.get_status() == HTTPClient.STATUS_BODY:
 			if job != _job:

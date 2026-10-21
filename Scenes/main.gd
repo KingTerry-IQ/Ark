@@ -5,6 +5,8 @@ extends Control
 ## without a host. Inscribe and Feature wait until GodOnChain is attached.
 
 const CFG := "user://ark.cfg"
+## GodOnChain often publishes its host a moment after Ark opens.
+const HOST_LOOK_WAIT := 2.0
 const CHAINS := ["mon", "sol", "rh"]
 const CHAIN_NAMES := {"mon": "Monad", "sol": "Solana", "rh": "Robinhood"}
 const FILE_COL_NAME := 0
@@ -35,6 +37,9 @@ var stage_files: Array = []
 var picked := {}
 var file_filter: LineEdit
 var file_type := ""
+var file_dir := ""
+var _folder_opened_at := -10000
+var _folders := {}
 var file_sort := "format"
 var file_sort_desc := false
 var _shown_files: Array = []
@@ -48,6 +53,15 @@ var _thumbs := {}
 var host_label: Label
 var cache_label: Label
 var status_label: Label
+var band_stack: Control
+var band_bar: ProgressBar
+var band_cancel: Button
+var _band_call := 0
+var _band_total := -1
+var _band_started := 0
+var _band_percent := false
+var _locked := false
+var _lock_shade: ColorRect
 var chain_buttons: Array = []
 var tab_buttons: Array = []
 var archive_view: Control
@@ -64,6 +78,7 @@ var stage_feature: Button
 var file_tree: Tree
 var files_empty: Label
 var type_box: HFlowContainer
+var crumb_box: HBoxContainer
 var derivatives_toggle: CheckButton
 var select_note: Label
 var quote_label: Label
@@ -76,7 +91,19 @@ var preview_box: Control
 var preview_title: Label
 var preview: RichTextLabel
 var picture: TextureRect
-var featured_box: HFlowContainer
+var featured_row: Control
+var featured_box: HBoxContainer
+var _collection_sizes := {}
+var _collection_peeking := {}
+var _collection_queue: Array = []
+var _collection_draining := false
+var _item_files := {}
+var _item_file_queue: Array = []
+var _item_file_peeking := {}
+var _item_file_gen := {}
+var _item_file_draining := false
+var _file_epoch := 0
+var _original_name_cache := {}
 var place_row: HBoxContainer
 var place_label: Label
 var count_label: Label
@@ -99,15 +126,22 @@ var _manifest: Array = []
 var _kind_rows: Array = []
 var _aboard_ids := {}
 var _aboard_page := {}
+## identifier -> {filename: true} for files whose parts are all on the chain.
+var _aboard_names := {}
+var _aboard_peek := 0
 
 
 func _ready() -> void:
 	theme = ArkTheme.build()
 	set_anchors_preset(Control.PRESET_FULL_RECT)
+	_fit_window()
 	_load_cfg()
 	fetch = Fetch.new()
 	add_child(fetch)
+	fetch.began.connect(_on_fetch_began)
+	fetch.sized.connect(_on_fetch_sized)
 	fetch.progressed.connect(_on_progress)
+	fetch.ended.connect(_on_fetch_ended)
 	iq = IQClient.new()
 	add_child(iq)
 	_build()
@@ -117,8 +151,28 @@ func _ready() -> void:
 	_discover()
 
 
+## 1920x1080 is the design size. On a screen with less room than that the
+## window maximizes and the canvas scales down to fit, rather than running
+## off the edge.
+func _fit_window() -> void:
+	if DisplayServer.get_name() == "headless" or not get_window().mode == Window.MODE_WINDOWED:
+		return
+	var room := DisplayServer.screen_get_usable_rect(get_window().current_screen).size
+	var want := get_window().size
+	if want.x > room.x or want.y > room.y:
+		get_window().mode = Window.MODE_MAXIMIZED
+
+
+func _input(event: InputEvent) -> void:
+	# An inscription must run through. A click or a key during it would start
+	# another chain call on top of the one the host is still finishing.
+	if _locked:
+		get_viewport().set_input_as_handled()
+		event.accept_event()
+
+
 func _unhandled_input(event: InputEvent) -> void:
-	if not event is InputEventKey:
+	if _locked or not event is InputEventKey:
 		return
 	var key := event as InputEventKey
 	if not key.pressed or key.echo:
@@ -175,7 +229,9 @@ func _build() -> void:
 	add_child(root)
 
 	root.add_child(_top_bar())
-	root.add_child(ArkTheme.rule(ArkTheme.GOLD_DIM))
+	band_stack = _progress_band()
+	root.add_child(band_stack)
+	root.add_child(_featured_band())
 
 	var split := HSplitContainer.new()
 	split.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -189,16 +245,122 @@ func _build() -> void:
 	stage.custom_minimum_size = Vector2(560, 0)
 	split.add_child(stage)
 
-	var foot := HBoxContainer.new()
-	foot.add_theme_constant_override("separation", 12)
-	root.add_child(foot)
-	status_label = ArkTheme.cell("Search the Archive. Pick an item. Choose its files.", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
-	foot.add_child(status_label)
-	var keys := ArkTheme.cell("Ctrl+F search   Ctrl+Shift+F filter files   double-click a file to open it", ArkTheme.GOLD_DIM, ArkTheme.SIZE_SMALL)
-	keys.size_flags_horizontal = Control.SIZE_SHRINK_END
-	keys.clip_text = false
+	var keys := ArkTheme.cell("Ctrl+F search   Ctrl+Shift+F filter files   click a folder to open it   double-click a file to open it   Backspace goes up", ArkTheme.GOLD_DIM, ArkTheme.SIZE_SMALL)
 	keys.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	foot.add_child(keys)
+	root.add_child(keys)
+
+
+## The status line, and the progress bar for every Archive fetch. It is
+## always there at one height, so a download starting or ending never moves
+## anything under the mouse.
+func _progress_band() -> Control:
+	var stack := Control.new()
+	stack.custom_minimum_size = Vector2(0, 34)
+	band_bar = ProgressBar.new()
+	band_bar.set_anchors_preset(Control.PRESET_FULL_RECT)
+	band_bar.show_percentage = false
+	band_bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	band_bar.add_theme_stylebox_override("background", ArkTheme.well(ArkTheme.HULL, 0))
+	band_bar.add_theme_stylebox_override("fill", ArkTheme.well(ArkTheme.GOLD, 0))
+	stack.add_child(band_bar)
+	var row := HBoxContainer.new()
+	row.set_anchors_preset(Control.PRESET_FULL_RECT)
+	row.offset_left = 12
+	row.offset_right = -4
+	row.add_theme_constant_override("separation", 10)
+	stack.add_child(row)
+	status_label = ArkTheme.cell("Search the Archive. Pick an item. Choose its files.", ArkTheme.SEA, ArkTheme.SIZE_BODY)
+	status_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	status_label.add_theme_color_override("font_outline_color", ArkTheme.INK)
+	status_label.add_theme_constant_override("outline_size", 6)
+	row.add_child(status_label)
+	band_cancel = ArkTheme.quiet_button("CANCEL", func() -> void: fetch.cancel())
+	band_cancel.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	band_cancel.tooltip_text = "Stop this download."
+	band_cancel.visible = false
+	row.add_child(band_cancel)
+	return stack
+
+
+func _on_fetch_began(call: int) -> void:
+	_band_call = call
+	_band_total = -1
+	_band_started = Time.get_ticks_msec()
+	band_bar.max_value = 1
+	band_bar.value = 0
+	band_bar.indeterminate = true
+	_band_percent = false
+	band_cancel.visible = call > 0 and not _locked
+	status_label.add_theme_color_override("font_color", ArkTheme.FOAM)
+	_paint_band(0)
+
+
+func _on_fetch_sized(total: int) -> void:
+	_band_total = total
+	band_bar.indeterminate = total <= 0
+	band_bar.max_value = maxi(total, 1)
+
+
+func _on_progress(received: int) -> void:
+	if _band_total > 0:
+		band_bar.value = received
+	_paint_band(received)
+
+
+func _on_fetch_ended(call: int) -> void:
+	if call != _band_call:
+		return
+	_band_call = 0
+	_band_percent = false
+	band_bar.indeterminate = false
+	band_bar.value = 0
+	band_cancel.visible = false
+	status_label.add_theme_color_override("font_color", ArkTheme.SEA)
+
+
+## Work that is not an Archive fetch, such as reading back from the chain,
+## holds the band with no size and no cancel.
+func _band_hold(note: String) -> void:
+	_progress_note = note
+	_on_fetch_began(-1)
+
+
+func _band_release() -> void:
+	_progress_note = ""
+	_on_fetch_ended(-1)
+
+
+## `percent` is 0-100. Zero leaves the bar indeterminate, which is what a
+## chain read looks like until the host reports a real fraction.
+func _band_tick(percent: float) -> void:
+	if _band_call != -1:
+		return
+	var p := clampf(percent, 0.0, 100.0)
+	if p <= 0.0:
+		return
+	_band_percent = true
+	band_bar.indeterminate = false
+	band_bar.max_value = 100
+	band_bar.value = p
+	_paint_band(int(p))
+
+
+func _paint_band(received: int) -> void:
+	if _band_percent:
+		var note := _progress_note if not _progress_note.is_empty() else "Working"
+		status_label.text = "%s  ·  %d%%" % [note, int(band_bar.value)]
+		return
+	var parts := PackedStringArray([_progress_note if not _progress_note.is_empty() else "Downloading"])
+	if _band_total > 0:
+		parts.append("%s of %s" % [_human_bytes(received), _human_bytes(_band_total)])
+	elif received > 0:
+		parts.append(_human_bytes(received))
+	var seconds := (Time.get_ticks_msec() - _band_started) / 1000.0
+	if seconds > 0.75 and received > 0:
+		parts.append("%s/s" % _human_bytes(int(received / seconds)))
+	if _band_total > 0:
+		parts.append("%d%%" % int(100.0 * received / _band_total))
+	status_label.text = "  ·  ".join(parts)
 
 
 func _top_bar() -> Control:
@@ -320,12 +482,6 @@ func _archive_view() -> Control:
 		var chip := _media_chip(str(pair[0]), str(pair[1]))
 		media.add_child(chip)
 		media_buttons.append({"kind": str(pair[0]), "button": chip})
-	featured_box = HFlowContainer.new()
-	featured_box.add_theme_constant_override("h_separation", 4)
-	featured_box.add_theme_constant_override("v_separation", 4)
-	featured_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	featured_box.visible = false
-	box.add_child(featured_box)
 
 	place_row = HBoxContainer.new()
 	place_row.add_theme_constant_override("separation", 8)
@@ -339,7 +495,7 @@ func _archive_view() -> Control:
 	place_row.add_child(place_label)
 	var feature := ArkTheme.quiet_button("FEATURE", _feature_current)
 	feature.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	feature.tooltip_text = "Put this collection on the featured band so others help finish it."
+	feature.tooltip_text = "Feature this collection. Everyone sees how much of it is aboard, and several collections can be featured at once."
 	place_row.add_child(feature)
 	var check := ArkTheme.quiet_button("CHECK", _check_current)
 	check.size_flags_vertical = Control.SIZE_SHRINK_CENTER
@@ -500,7 +656,7 @@ func _stage_pane() -> Control:
 	web.tooltip_text = "Open this item's page on archive.org"
 	side.add_child(web)
 	stage_feature = ArkTheme.quiet_button("FEATURE", _feature_item)
-	stage_feature.tooltip_text = "Feature this item so others help bring all of it aboard."
+	stage_feature.tooltip_text = "Feature this archive. Everyone sees how many of its files are aboard, beside any other featured collection."
 	side.add_child(stage_feature)
 	var forget := ArkTheme.quiet_button("CLEAR CACHE", _clear_item)
 	forget.tooltip_text = "Delete this item's cached files on this machine. The chain is not touched."
@@ -540,12 +696,20 @@ func _stage_pane() -> Control:
 	picks.add_child(type_box)
 	var all := ArkTheme.quiet_button("SELECT SHOWN", _select_shown.bind(true))
 	all.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
-	all.tooltip_text = "Tick every file the filter and type currently show."
+	all.tooltip_text = "Tick every file the filter and type currently show. Files inside the listed folders are left alone."
 	picks.add_child(all)
 	var none := ArkTheme.quiet_button("CLEAR", _select_none)
 	none.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
 	none.tooltip_text = "Untick every file."
 	picks.add_child(none)
+
+	# One line, always: a wrapping path would push the table down mid-click.
+	crumb_box = HBoxContainer.new()
+	crumb_box.add_theme_constant_override("separation", 4)
+	crumb_box.clip_contents = true
+	crumb_box.custom_minimum_size = Vector2(0, 28)
+	crumb_box.visible = false
+	box.add_child(crumb_box)
 
 	file_tree = Tree.new()
 	file_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -564,7 +728,9 @@ func _stage_pane() -> Control:
 	file_tree.set_column_title_alignment(FILE_COL_SIZE, HORIZONTAL_ALIGNMENT_RIGHT)
 	file_tree.item_edited.connect(_on_file_edited)
 	file_tree.item_activated.connect(_on_file_activated)
+	file_tree.item_mouse_selected.connect(_on_file_clicked)
 	file_tree.column_title_clicked.connect(_on_file_sort)
+	file_tree.gui_input.connect(_on_file_tree_input)
 	box.add_child(file_tree)
 	_paint_file_titles()
 	files_empty = ArkTheme.line("", ArkTheme.SEA, ArkTheme.SIZE_SMALL)
@@ -702,10 +868,12 @@ func _sync_actions() -> void:
 		return
 	var count := _selected_files().size()
 	var none := item.is_empty() or count == 0
-	open_button.disabled = none
-	inscribe_button.disabled = none
+	open_button.disabled = none or _locked
+	var inscribable := _inscribable_files()
+	inscribe_button.visible = not _inscribe_hidden()
+	inscribe_button.disabled = inscribable.is_empty() or _locked
 	var hosted := iq != null and iq.is_available()
-	host_hint.visible = not hosted and not item.is_empty()
+	host_hint.visible = not hosted and not item.is_empty() and inscribe_button.visible
 
 
 func _on_chain(index: int) -> void:
@@ -714,24 +882,41 @@ func _on_chain(index: int) -> void:
 		ArkTheme.paint_choice(chain_buttons[at], at == index)
 	_save_cfg()
 	sol_note.visible = chain == "sol"
+	_file_epoch += 1
+	_item_files.clear()
+	_item_file_queue.clear()
+	_item_file_peeking.clear()
 	_quote()
 	await _refresh_board()
 
 
+## One try, then the cabinet. If GodOnChain is not up yet, keep looking and
+## refresh once it answers. The mirror stays on screen in the meantime.
 func _discover() -> void:
-	var ok: bool = await iq.discover()
+	while is_inside_tree():
+		var ok: bool = await iq.discover()
+		if not is_inside_tree():
+			return
+		_paint_host(ok)
+		if ok:
+			await _refresh_board()
+			return
+		await get_tree().create_timer(HOST_LOOK_WAIT).timeout
+
+
+func _paint_host(ok: bool) -> void:
 	var colour := ArkTheme.GREEN if ok else ArkTheme.SEA
 	if ok:
-		host_label.text = "● %s" % iq.app_label
+		var label := iq.app_label if not iq.app_label.is_empty() else "GodOnChain"
+		host_label.text = "● %s" % label
 		host_label.tooltip_text = "GodOnChain is attached. Inscribe, Feature and read-back are available."
 	else:
-		host_label.text = "○ NO HOST · BROWSE ONLY"
-		host_label.tooltip_text = "Search and OPEN work now. Launch Ark from GodOnChain to inscribe."
+		host_label.text = "○ LOOKING FOR HOST"
+		host_label.tooltip_text = "Search and OPEN work now. Ark will refresh the cabinet when GodOnChain is up."
 	host_label.mouse_filter = Control.MOUSE_FILTER_PASS
 	host_label.add_theme_color_override("font_color", colour)
 	host_label.add_theme_stylebox_override("normal", ArkTheme._box(colour, Color(colour, 0.1), 8, 3, 1))
 	_sync_actions()
-	await _refresh_board()
 
 
 func _search_fresh() -> void:
@@ -985,14 +1170,125 @@ func _sync_sort() -> void:
 	sort_box.selected = index
 
 
-func _featured_chip(label: String, title: String, ia: String, slug: String) -> Button:
-	var shown := label if not label.is_empty() else title
-	return ArkTheme.choice(shown, false, func() -> void:
-		if not ia.is_empty():
-			await _enter_collection({"identifier": ia, "title": title, "mediatype": "collection"})
-		else:
-			await _open_kind(slug, title, true)
+func _featured_band() -> Control:
+	featured_row = HBoxContainer.new()
+	featured_row.add_theme_constant_override("separation", 10)
+	featured_row.visible = false
+	var heading := ArkTheme.cell("FEATURED", ArkTheme.WATER, ArkTheme.SIZE_SMALL)
+	heading.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	heading.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	featured_row.add_child(heading)
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.custom_minimum_size = Vector2(0, 76)
+	featured_row.add_child(scroll)
+	featured_box = HBoxContainer.new()
+	featured_box.add_theme_constant_override("separation", 8)
+	featured_box.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	scroll.add_child(featured_box)
+	return featured_row
+
+
+func _featured_card(view: Dictionary) -> PanelContainer:
+	var slug := str(view.get("slug", ""))
+	var ia := str(view.get("ia", ""))
+	var title := str(view.get("title", slug))
+	var aboard := int(view.get("aboard", 0))
+	var total := int(view.get("total", 0))
+	var known := bool(view.get("known", false)) and total > 0
+	var member := str(view.get("member", ""))
+	var files_known := bool(view.get("files_known", false))
+	var files_total := int(view.get("files_total", 0))
+	var files_aboard := int(view.get("files_aboard", 0))
+	var grouping := not member.is_empty()
+	var card := PanelContainer.new()
+	card.custom_minimum_size = Vector2(240, 0)
+	card.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	card.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	card.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	if grouping:
+		card.tooltip_text = "Open %s. The bar is original files aboard on this chain, out of the whole archive." % title
+	elif not ia.is_empty():
+		card.tooltip_text = "Open %s. The bar is items aboard against the whole collection. CHECK confirms every original file." % title
+	else:
+		card.tooltip_text = "Open %s. The bar is shelf items that are aboard." % title
+	var fraction_text := ""
+	var bar_known := false
+	var bar_aboard := 0
+	var bar_total := 1
+	if grouping and files_known and files_total <= 0:
+		fraction_text = "No original files"
+	elif grouping and files_known:
+		fraction_text = "%s / %s files" % [Archive.grouped(files_aboard), Archive.grouped(files_total)]
+		bar_known = true
+		bar_aboard = files_aboard
+		bar_total = files_total
+	elif grouping and files_total > 0 and iq != null and iq.is_available():
+		fraction_text = "… / %s files" % Archive.grouped(files_total)
+	elif grouping and files_total > 0:
+		fraction_text = "%s files" % Archive.grouped(files_total)
+	elif grouping and iq != null and iq.is_available():
+		fraction_text = "Counting files"
+	elif grouping:
+		fraction_text = "Host needed to count files"
+	else:
+		fraction_text = _progress_text(aboard, total, known, ia)
+		bar_known = known
+		bar_aboard = aboard
+		bar_total = total if total > 0 else 1
+	var resting := ArkTheme._box(ArkTheme.GOLD_DIM, ArkTheme.HULL, 10, 8, 1)
+	var hot := ArkTheme._box(ArkTheme.GOLD, ArkTheme.HULL_RAISED, 10, 8, 1)
+	card.add_theme_stylebox_override("panel", resting)
+	var box := VBoxContainer.new()
+	box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box.add_theme_constant_override("separation", 2)
+	card.add_child(box)
+	var name := ArkTheme.cell(title, ArkTheme.PARCHMENT, ArkTheme.SIZE_SMALL)
+	name.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	name.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	box.add_child(name)
+	var fraction := ArkTheme.cell(fraction_text, ArkTheme.WATER, ArkTheme.SIZE_SMALL)
+	fraction.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box.add_child(fraction)
+	var bar := ProgressBar.new()
+	bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bar.show_percentage = false
+	bar.custom_minimum_size = Vector2(220, 8)
+	bar.max_value = maxi(bar_total, 1)
+	bar.value = mini(bar_aboard, int(bar.max_value)) if bar_known else 0
+	box.add_child(bar)
+	card.mouse_entered.connect(func() -> void:
+		card.add_theme_stylebox_override("panel", hot)
 	)
+	card.mouse_exited.connect(func() -> void:
+		card.add_theme_stylebox_override("panel", resting)
+	)
+	card.gui_input.connect(func(event: InputEvent) -> void:
+		if event is InputEventMouseButton:
+			var mouse := event as InputEventMouseButton
+			if mouse.pressed and mouse.button_index == MOUSE_BUTTON_LEFT:
+				card.accept_event()
+				if not ia.is_empty():
+					await _enter_collection({"identifier": ia, "title": title, "mediatype": "collection"})
+				elif not member.is_empty():
+					if str(item.get("identifier", "")) != member:
+						await _load_item(member)
+				else:
+					await _open_kind(slug, title, true)
+	)
+	return card
+
+
+func _progress_text(aboard: int, total: int, known: bool, ia: String) -> String:
+	if known:
+		return "%s / %s aboard" % [Archive.grouped(aboard), Archive.grouped(total)]
+	if aboard > 0:
+		return "%s aboard" % Archive.grouped(aboard)
+	if ia.is_empty():
+		return "No items on this shelf"
+	return "Counting the collection"
 
 
 ## A clickable list row. It stays lit while its item is the one open.
@@ -1229,6 +1525,9 @@ func _fill_stage() -> void:
 		if file is Dictionary and not hidden.call(file):
 			visible.append(file)
 	stage_files = Archive.arrange_files(visible)
+	_folders = Archive.folder_index(stage_files)
+	if not same or not _folders.has(file_dir):
+		file_dir = ""
 	picked = {}
 	for at in stage_files.size():
 		var name := str((stage_files[at] as Dictionary).get("name", ""))
@@ -1242,6 +1541,7 @@ func _fill_stage() -> void:
 	_paint_stage_files()
 	_paint_rows()
 	_quote()
+	_peek_aboard_names()
 
 
 func _paint_item_head() -> void:
@@ -1303,27 +1603,42 @@ func _open_details() -> void:
 		OS.shell_open("https://archive.org/details/" + identifier.uri_encode())
 
 
-## One chip per format, largest first, each with its count.
+## One chip per format in the item, largest first, each counting what is
+## under the open folder. The set, the order and every chip's width come
+## from the whole item, so opening a folder never rewraps the row and moves
+## the table under the mouse. The font is monospaced; padding holds widths.
 func _paint_types() -> void:
 	for child in type_box.get_children():
 		child.queue_free()
-	var counts := {}
+	var totals := {}
 	for file in stage_files:
 		var section := Archive.file_section(file)
+		totals[section] = int(totals.get(section, 0)) + 1
+	var counts := {}
+	var scope: Array = _folder_files(file_dir)
+	for at in scope:
+		var section := Archive.file_section(stage_files[at])
 		counts[section] = int(counts.get(section, 0)) + 1
-	var order: Array = counts.keys()
+	var order: Array = totals.keys()
 	order.sort_custom(func(a: String, b: String) -> bool:
-		if counts[a] != counts[b]:
-			return counts[a] > counts[b]
+		if totals[a] != totals[b]:
+			return totals[a] > totals[b]
 		return a.nocasecmp_to(b) < 0
 	)
 	if not file_type.is_empty() and not counts.has(file_type):
 		file_type = ""
-	type_box.add_child(_type_chip("", "All  %s" % Archive.grouped(stage_files.size())))
+	var all_width := Archive.grouped(stage_files.size()).length()
+	type_box.add_child(_type_chip("", "All  %s" % Archive.grouped(scope.size()).lpad(all_width)))
 	if order.size() < 2:
 		return
 	for section in order:
-		type_box.add_child(_type_chip(str(section), "%s  %s" % [section, Archive.grouped(int(counts[section]))]))
+		var width := Archive.grouped(int(totals[section])).length()
+		var count := int(counts.get(section, 0))
+		var chip := _type_chip(str(section), "%s  %s" % [section, Archive.grouped(count).lpad(width)])
+		chip.disabled = count == 0
+		if count == 0:
+			chip.tooltip_text = "None in this folder."
+		type_box.add_child(chip)
 
 
 func _type_chip(section: String, label: String) -> Button:
@@ -1355,7 +1670,8 @@ func _paint_file_titles() -> void:
 
 func _on_file_sort(column: int, _mouse_button: int) -> void:
 	var keys := {FILE_COL_NAME: "name", FILE_COL_FORMAT: "format", FILE_COL_SIZE: "size"}
-	if not keys.has(column):
+	# A click meant for the folder that just opened is not a sort.
+	if not keys.has(column) or _just_opened():
 		return
 	var next := str(keys[column])
 	if next == file_sort:
@@ -1367,18 +1683,25 @@ func _on_file_sort(column: int, _mouse_button: int) -> void:
 	_paint_stage_files()
 
 
-## Rebuilds the table from stage_files, the filter, the type chip and the sort.
+## Rebuilds the table from stage_files, the open folder, the filter, the type
+## chip and the sort. An empty filter and no type chip list the open folder
+## the way archive.org/download/ does: its folders, then its own files. Either
+## one turns the listing flat, over every file beneath the open folder.
 ## picked stays keyed by stage_files index, so a filter never loses a tick.
 func _paint_stage_files() -> void:
 	file_tree.clear()
 	var root := file_tree.create_item()
+	_paint_crumbs()
 	var needle := file_filter.text.strip_edges().to_lower()
+	var flat := not needle.is_empty() or not file_type.is_empty()
+	var scope: Dictionary = _folders.get(file_dir, {})
+	var pool: Array = scope.get("all" if flat else "files", [])
 	var matched: Array = []
-	for index in stage_files.size():
+	for index in pool:
 		var file: Dictionary = stage_files[index]
 		if not file_type.is_empty() and Archive.file_section(file) != file_type:
 			continue
-		if not needle.is_empty() and str(file.get("name", "")).to_lower().find(needle) < 0:
+		if not needle.is_empty() and Archive.relative_to(str(file.get("name", "")), file_dir).to_lower().find(needle) < 0:
 			continue
 		matched.append(index)
 	if file_sort == "name":
@@ -1391,9 +1714,36 @@ func _paint_stage_files() -> void:
 		)
 	if file_sort_desc:
 		matched.reverse()
+	var dirs: Array = [] if flat else (scope.get("dirs", []) as Array).duplicate()
+	if file_sort == "size":
+		dirs.sort_custom(func(a: String, b: String) -> bool:
+			return int(_folders[a]["bytes"]) < int(_folders[b]["bytes"])
+		)
+	if file_sort_desc and file_sort != "format":
+		dirs.reverse()
+	# Only rows with a box count. A folder is never ticked in one stray click.
 	_shown_files = matched
+	if not flat and not file_dir.is_empty():
+		var up := file_tree.create_item(root)
+		up.set_text(FILE_COL_NAME, "↰  ..")
+		up.set_custom_color(FILE_COL_NAME, ArkTheme.SEA)
+		up.set_tooltip_text(FILE_COL_NAME, "Up to %s" % _folder_label(Archive.file_folder(file_dir)))
+		up.set_metadata(FILE_COL_NAME, "..")
+	for path in dirs:
+		var entry: Dictionary = _folders[path]
+		var count := (entry["all"] as Array).size()
+		var row := file_tree.create_item(root)
+		row.set_text(FILE_COL_NAME, "▸  " + str(path).get_file() + "/")
+		row.set_custom_color(FILE_COL_NAME, ArkTheme.GOLD)
+		row.set_tooltip_text(FILE_COL_NAME, "%s/\nClick to open." % path)
+		row.set_metadata(FILE_COL_NAME, path)
+		row.set_text(FILE_COL_FORMAT, "%s file%s" % [Archive.grouped(count), "" if count == 1 else "s"])
+		row.set_custom_color(FILE_COL_FORMAT, ArkTheme.GOLD_DIM)
+		row.set_text(FILE_COL_SIZE, _human_bytes(int(entry["bytes"])))
+		row.set_text_alignment(FILE_COL_SIZE, HORIZONTAL_ALIGNMENT_RIGHT)
+		row.set_custom_color(FILE_COL_SIZE, ArkTheme.SEA)
+		_paint_folder_tick(row)
 	var identifier := str(item.get("identifier", ""))
-	var from_chain := bool(item.get("from_chain", false))
 	for at in matched:
 		var file: Dictionary = stage_files[at]
 		var name := str(file.get("name", ""))
@@ -1401,7 +1751,7 @@ func _paint_stage_files() -> void:
 		row.set_cell_mode(FILE_COL_NAME, TreeItem.CELL_MODE_CHECK)
 		row.set_editable(FILE_COL_NAME, true)
 		row.set_checked(FILE_COL_NAME, bool(picked.get(at, false)))
-		row.set_text(FILE_COL_NAME, name)
+		row.set_text(FILE_COL_NAME, Archive.relative_to(name, file_dir))
 		row.set_tooltip_text(FILE_COL_NAME, name)
 		row.set_metadata(FILE_COL_NAME, at)
 		row.set_text(FILE_COL_FORMAT, Archive.file_section(file))
@@ -1410,35 +1760,205 @@ func _paint_stage_files() -> void:
 		row.set_text(FILE_COL_SIZE, _human_bytes(Ark.file_bytes(file)))
 		row.set_text_alignment(FILE_COL_SIZE, HORIZONTAL_ALIGNMENT_RIGHT)
 		row.set_custom_color(FILE_COL_SIZE, ArkTheme.SEA)
-		if from_chain:
+		if _file_aboard(name):
 			row.set_text(FILE_COL_STATE, "aboard")
 			row.set_custom_color(FILE_COL_STATE, ArkTheme.LAMP)
+			row.set_tooltip_text(FILE_COL_STATE, "Already on this chain.")
 		elif not cache.sha_for(identifier, name).is_empty():
 			row.set_text(FILE_COL_STATE, "cached")
 			row.set_custom_color(FILE_COL_STATE, ArkTheme.WATER)
 			row.set_tooltip_text(FILE_COL_STATE, "Already on this machine. OPEN is instant.")
-	files_empty.visible = matched.is_empty()
+	files_empty.visible = matched.is_empty() and dirs.is_empty()
 	if stage_files.is_empty():
 		files_empty.text = "This item lists no original files.\nTurn on Derivatives to see what the Archive generated." if not show_all else "This item lists no files."
-	else:
+	elif file_dir.is_empty():
 		files_empty.text = "No files match this filter."
+	else:
+		files_empty.text = "No files in %s/ match this filter." % file_dir
 	_paint_stage_note()
+
+
+## Every stage_files index at or beneath a folder.
+func _folder_files(path: String) -> Array:
+	if not _folders.has(path):
+		return []
+	return _folders[path]["all"]
+
+
+## The stage_files index on a file row, or -1 on a folder or the up row.
+func _row_file(row: TreeItem) -> int:
+	var meta: Variant = row.get_metadata(FILE_COL_NAME)
+	return int(meta) if meta is int else -1
+
+
+func _row_folder(row: TreeItem) -> String:
+	var meta: Variant = row.get_metadata(FILE_COL_NAME)
+	return str(meta) if meta is String else ""
+
+
+## How much of a folder is ticked, in the state column. A folder has no box.
+func _paint_folder_tick(row: TreeItem) -> void:
+	var inside := _folder_files(_row_folder(row))
+	var ticked := 0
+	for at in inside:
+		if bool(picked.get(at, false)):
+			ticked += 1
+	row.set_text(FILE_COL_STATE, "%s ✓" % Archive.grouped(ticked) if ticked > 0 else "")
+	row.set_custom_color(FILE_COL_STATE, ArkTheme.GOLD)
+	row.set_tooltip_text(FILE_COL_STATE, "%s of %s files inside are ticked." % [Archive.grouped(ticked), Archive.grouped(inside.size())] if ticked > 0 else "")
+
+
+func _folder_label(path: String) -> String:
+	return str(item.get("identifier", "")) if path.is_empty() else path.get_file()
+
+
+## Breadcrumbs back up the folder path, and the one way to tick a whole
+## folder. An item with no folders has neither.
+func _paint_crumbs() -> void:
+	for child in crumb_box.get_children():
+		child.queue_free()
+	var nested := not (_folders.get("", {}).get("dirs", []) as Array).is_empty()
+	crumb_box.visible = nested
+	file_filter.placeholder_text = "Filter files by name" if file_dir.is_empty() else "Filter files in %s/ by name" % file_dir
+	if not nested:
+		return
+	var trail: Array = [""]
+	if not file_dir.is_empty():
+		var parts := file_dir.split("/")
+		for at in parts.size():
+			trail.append("/".join(parts.slice(0, at + 1)))
+	# A deep path keeps the top and the last three steps on its one line.
+	if trail.size() > 5:
+		trail = [trail[0], "…"] + trail.slice(trail.size() - 3)
+	for at in trail.size():
+		var path := str(trail[at])
+		if at > 0:
+			crumb_box.add_child(_crumb_text("/", ArkTheme.GOLD_DIM))
+		if path == "…":
+			crumb_box.add_child(_crumb_text("…", ArkTheme.GOLD_DIM))
+		elif at == trail.size() - 1:
+			var here := _crumb_text(_crumb_label(path), ArkTheme.GOLD)
+			here.tooltip_text = path + "/"
+			here.mouse_filter = Control.MOUSE_FILTER_PASS
+			crumb_box.add_child(here)
+		else:
+			var crumb := ArkTheme.quiet_button(_crumb_label(path), _open_folder.bind(path))
+			crumb.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+			crumb.tooltip_text = "Back to %s" % (path + "/" if not path.is_empty() else "the top of the item")
+			crumb_box.add_child(crumb)
+	# Only worth offering when there is more inside than the rows show.
+	if not (_folders[file_dir]["dirs"] as Array).is_empty():
+		var gap := Control.new()
+		gap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		crumb_box.add_child(gap)
+		var whole := ArkTheme.quiet_button("SELECT FOLDER…", _select_folder)
+		whole.tooltip_text = "Tick every file in this folder and all the folders inside it. Asks first."
+		crumb_box.add_child(whole)
+
+
+func _crumb_label(path: String) -> String:
+	var text := _folder_label(path)
+	return text if text.length() <= 32 else text.substr(0, 31) + "…"
+
+
+func _crumb_text(text: String, colour: Color) -> Label:
+	var label := ArkTheme.line(text, colour, ArkTheme.SIZE_SMALL)
+	label.autowrap_mode = TextServer.AUTOWRAP_OFF
+	label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	return label
+
+
+func _select_folder() -> void:
+	var path := file_dir
+	var inside := _folder_files(path)
+	if inside.is_empty():
+		return
+	var where := "all of %s" % _folder_label(path) if path.is_empty() else "%s/" % path
+	var body := "Tick %s file%s in %s, including every folder inside it?\n\n%s in all." % [
+		Archive.grouped(inside.size()),
+		"" if inside.size() == 1 else "s",
+		where,
+		_human_bytes(int(_folders[path]["bytes"])),
+	]
+	if not await _confirm("Select the whole folder", body, "TICK THEM ALL"):
+		return
+	for at in inside:
+		picked[at] = true
+	_sync_ticks()
+
+
+func _open_folder(path: String) -> void:
+	if not _folders.has(path):
+		return
+	file_dir = path
+	_folder_opened_at = Time.get_ticks_msec()
+	_stage_lock = true
+	file_filter.text = ""
+	_stage_lock = false
+	_paint_types()
+	_paint_stage_files()
+
+
+func _on_file_tree_input(event: InputEvent) -> void:
+	var key := event as InputEventKey
+	if key == null or not key.pressed or file_dir.is_empty():
+		return
+	if key.keycode == KEY_BACKSPACE:
+		_open_folder(Archive.file_folder(file_dir))
+		file_tree.accept_event()
 
 
 func _on_file_edited() -> void:
 	var row := file_tree.get_edited()
 	if row == null:
 		return
-	picked[int(row.get_metadata(FILE_COL_NAME))] = row.is_checked(FILE_COL_NAME)
+	var at := _row_file(row)
+	if at < 0:
+		return
+	if _just_opened():
+		row.set_checked(FILE_COL_NAME, bool(picked.get(at, false)))
+		return
+	picked[at] = row.is_checked(FILE_COL_NAME)
 	_paint_stage_note()
 	_quote()
 
 
+## One click opens a folder or goes up. Files still want a double click,
+## since opening one downloads it.
+func _on_file_clicked(_position: Vector2, button: int) -> void:
+	if button != MOUSE_BUTTON_LEFT or _just_opened():
+		return
+	var row := file_tree.get_selected()
+	if row == null or _row_file(row) >= 0:
+		return
+	# The tree is rebuilt, so not from inside its own click.
+	_enter_row.call_deferred(_row_folder(row))
+
+
+func _enter_row(folder: String) -> void:
+	if folder == "..":
+		_open_folder(Archive.file_folder(file_dir))
+	elif not folder.is_empty():
+		_open_folder(folder)
+
+
+## A habitual double click on a folder lands its second click on whatever row
+## the new listing put under the mouse. That click is not a choice.
+func _just_opened() -> bool:
+	return Time.get_ticks_msec() - _folder_opened_at < 450
+
+
 func _on_file_activated() -> void:
 	var row := file_tree.get_selected()
-	if row == null or busy:
+	if row == null or _just_opened():
 		return
-	var at := int(row.get_metadata(FILE_COL_NAME))
+	var folder := _row_folder(row)
+	if not folder.is_empty():
+		_enter_row(folder)
+		return
+	if busy:
+		return
+	var at := _row_file(row)
 	if at < 0 or at >= stage_files.size():
 		return
 	busy = true
@@ -1463,7 +1983,11 @@ func _sync_ticks() -> void:
 	var root := file_tree.get_root()
 	if root != null:
 		for row in root.get_children():
-			row.set_checked(FILE_COL_NAME, bool(picked.get(int(row.get_metadata(FILE_COL_NAME)), false)))
+			var at := _row_file(row)
+			if at >= 0:
+				row.set_checked(FILE_COL_NAME, bool(picked.get(at, false)))
+			elif _row_folder(row) != "..":
+				_paint_folder_tick(row)
 	_paint_stage_note()
 	_quote()
 
@@ -1474,16 +1998,29 @@ func _paint_stage_note() -> void:
 	var chosen := _selected_files()
 	var raw := 0
 	for file in chosen:
-		raw += Ark.file_bytes(file)
+		if not _file_aboard(str(file.get("name", ""))):
+			raw += Ark.file_bytes(file)
+	var aboard_n := 0
+	for file in chosen:
+		if _file_aboard(str(file.get("name", ""))):
+			aboard_n += 1
 	if chosen.is_empty():
 		select_note.text = "Nothing selected"
 		select_note.add_theme_color_override("font_color", ArkTheme.SEA)
-	else:
-		select_note.text = "%s file%s · %s" % [
+	elif aboard_n == chosen.size():
+		select_note.text = "%s file%s already aboard" % [
 			Archive.grouped(chosen.size()),
 			"" if chosen.size() == 1 else "s",
+		]
+		select_note.add_theme_color_override("font_color", ArkTheme.LAMP)
+	else:
+		select_note.text = "%s file%s · %s" % [
+			Archive.grouped(chosen.size() - aboard_n),
+			"" if chosen.size() - aboard_n == 1 else "s",
 			_human_bytes(raw),
 		]
+		if aboard_n > 0:
+			select_note.text += " · %s aboard" % Archive.grouped(aboard_n)
 		select_note.add_theme_color_override("font_color", ArkTheme.FOAM)
 	var text := "of %s" % Archive.grouped(stage_files.size())
 	if _shown_files.size() != stage_files.size():
@@ -1500,15 +2037,75 @@ func _selected_files() -> Array:
 	return chosen
 
 
-func _quote() -> void:
+## A file already on this chain. The Aboard listing carries the flag from the
+## file row. The Archive listing learns the names after an inscription, or
+## from a chain read of an item the manifest already lists.
+func _file_aboard(name: String) -> bool:
+	if name.is_empty():
+		return false
+	if bool(item.get("from_chain", false)):
+		for file in stage_files:
+			if str(file.get("name", "")) != name:
+				continue
+			return bool(file.get("aboard", true))
+		return true
+	var ident := str(item.get("identifier", ""))
+	var known: Dictionary = _aboard_names.get(ident, {})
+	return bool(known.get(name, false))
+
+
+func _inscribable_files() -> Array:
+	var chosen: Array = []
+	for file in _selected_files():
+		if not _file_aboard(str(file.get("name", ""))):
+			chosen.append(file)
+	return chosen
+
+
+## Hide INSCRIBE when there is nothing left to write. An Aboard listing whose
+## files are all complete has no button at all. A mixed Archive selection hides
+## it once every ticked file is already aboard.
+func _inscribe_hidden() -> bool:
 	if item.is_empty():
+		return false
+	if bool(item.get("from_chain", false)):
+		for file in stage_files:
+			if not _file_aboard(str(file.get("name", ""))):
+				return false
+		return true
+	var selected := _selected_files()
+	if selected.is_empty():
+		return false
+	for file in selected:
+		if not _file_aboard(str(file.get("name", ""))):
+			return false
+	return true
+
+
+func _remember_aboard(ident: String, names: PackedStringArray) -> void:
+	if ident.is_empty():
+		return
+	var known: Dictionary = _aboard_names.get(ident, {})
+	for name in names:
+		if not name.is_empty():
+			known[name] = true
+	_aboard_names[ident] = known
+
+
+func _quote() -> void:
+	if item.is_empty() or bool(item.get("from_chain", false)) and _inscribe_hidden():
 		quote_label.text = ""
+		quote_others.text = ""
+		sol_note.visible = false
 		return
 	var raws: Array = []
 	var file_rows: Array = []
 	var index := 0
+	var skipped := 0
 	for file in stage_files:
-		if not bool(picked.get(index, false)):
+		if not bool(picked.get(index, false)) or _file_aboard(str(file.get("name", ""))):
+			if bool(picked.get(index, false)):
+				skipped += 1
 			index += 1
 			continue
 		var size := Ark.file_bytes(file)
@@ -1518,8 +2115,8 @@ func _quote() -> void:
 			raws.append(Ark.part_raw(size, part))
 		index += 1
 	if raws.is_empty():
-		quote_label.text = "Tick files for a fee estimate"
-		quote_label.add_theme_color_override("font_color", ArkTheme.SEA)
+		quote_label.text = "Already aboard" if skipped > 0 else "Tick files for a fee estimate"
+		quote_label.add_theme_color_override("font_color", ArkTheme.LAMP if skipped > 0 else ArkTheme.SEA)
 		quote_others.text = ""
 		sol_note.visible = false
 		return
@@ -1591,14 +2188,14 @@ func _ensure_cached(file: Dictionary, prefer_chain: bool = false) -> String:
 	# the Archive, because a missing part cannot be rebuilt from the chain.
 	if prefer_chain and bool(item.get("from_chain", false)):
 		return await _read_back(file)
-	var staged := "user://staging".path_join(name.get_file())
+	var staged := "user://staging".path_join(Archive.local_name(name))
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://staging"))
-	_progress_note = "Downloading %s" % name
+	_progress_note = "Downloading %s" % name.get_file()
 	_status(_progress_note)
 	var ok: bool = await fetch.download(Archive.download_url(identifier, name), staged)
 	_progress_note = ""
 	if not ok:
-		_status("Download failed. %s" % fetch.last_error)
+		_status("Download cancelled." if fetch.last_error == "Cancelled." else "Download failed. %s" % fetch.last_error)
 		return ""
 	if not Archive.hashes_match(staged, str(file.get("md5", "")), str(file.get("sha1", ""))):
 		DirAccess.remove_absolute(ProjectSettings.globalize_path(staged))
@@ -1618,11 +2215,13 @@ func _read_back(file: Dictionary) -> String:
 	if iq == null or not iq.is_available():
 		_status("Reading this back needs GodOnChain.")
 		return ""
-	var staged := "user://staging".path_join(name.get_file())
+	var staged := "user://staging".path_join(Archive.local_name(name))
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://staging"))
 	_status("Reading %s back from the chain." % name)
 	var cabinet := Cabinet.new(iq, chain)
-	var got: Dictionary = await cabinet.reassemble(identifier, name, staged)
+	_band_hold("Reading %s back from the chain" % name.get_file())
+	var got: Dictionary = await cabinet.reassemble(identifier, name, staged, _band_tick)
+	_band_release()
 	if not bool(got.get("ok", false)):
 		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "Read-back failed.")
 		return ""
@@ -1637,7 +2236,7 @@ func _read_back(file: Dictionary) -> String:
 
 func _cache_sibling(file: Dictionary, video_sha: String, identifier: String) -> void:
 	var name := str(file.get("name", ""))
-	var staged := "user://staging".path_join(name.get_file())
+	var staged := "user://staging".path_join(Archive.local_name(name))
 	var chain_sha := str(file.get("sha256", "")).strip_edges().to_lower()
 	if bool(item.get("from_chain", false)) and not chain_sha.is_empty() and iq != null and iq.is_available():
 		if cache.has_sha(chain_sha):
@@ -1699,7 +2298,7 @@ func _show_preview(kind: String, absolute: String, name: String = "") -> void:
 
 
 func _inscribe_checked() -> void:
-	if busy or item.is_empty():
+	if busy or _locked or item.is_empty():
 		return
 	if iq == null or not iq.is_available():
 		_status("Inscribe needs GodOnChain running, with this app launched by it.")
@@ -1708,12 +2307,12 @@ func _inscribe_checked() -> void:
 	if not await cabinet.is_kindled():
 		_status("This chain has not been kindled.")
 		return
-	var chosen := _selected_files()
+	var chosen := _inscribable_files()
 	var raw := 0
 	for file in chosen:
 		raw += Ark.file_bytes(file)
 	if chosen.is_empty():
-		_status("Select a file to inscribe.")
+		_status("Those files are already aboard." if not _selected_files().is_empty() else "Select a file to inscribe.")
 		return
 	busy = true
 	var proceed: bool = await _confirm(
@@ -1735,62 +2334,112 @@ func _inscribe_checked() -> void:
 			busy = false
 			_status("Inscribe cancelled.")
 			return
+	# From here until the chain work finishes, nothing else in this window runs.
+	_set_locked(true)
 	var paths := {}
+	var cached := true
 	for file in chosen:
 		var sha := await _ensure_cached(file)
 		if sha.is_empty():
-			busy = false
-			return
+			cached = false
+			break
 		paths[str(file.get("name", ""))] = cache.path_of(sha)
-	var kinds: Array = []
-	var active := _active_kind()
-	if not active.is_empty():
-		kinds.append(active)
-	var wrote: bool = await cabinet.inscribe(
-		item,
-		chosen,
-		paths,
-		func(text: String) -> void: _status(text),
-		kinds
-	)
+	var note := ""
+	if cached:
+		var kinds: Array = []
+		var active := _active_kind()
+		if not active.is_empty():
+			kinds.append(active)
+		_band_hold("Inscribing onto %s" % chain.to_upper())
+		var wrote: bool = await cabinet.inscribe(
+			item,
+			chosen,
+			paths,
+			func(text: String) -> void: _status(text),
+			kinds,
+			_band_tick
+		)
+		if wrote:
+			var names := PackedStringArray()
+			for file in chosen:
+				names.append(str(file.get("name", "")))
+			_remember_aboard(str(item.get("identifier", "")), names)
+			_status("Checking the manifest.")
+			var repaired: int = await cabinet.repair()
+			_forget_grouping_files(str(item.get("identifier", "")))
+			await _refresh_board()
+			_paint_file_states()
+			_quote()
+			var ident := str(item.get("identifier", ""))
+			if repaired < 0:
+				note = cabinet.last_error if not cabinet.last_error.is_empty() else "Repair failed."
+			elif repaired > 0:
+				note = "Aboard: %s. Repair added %d." % [ident, repaired]
+			else:
+				note = "Aboard: %s." % ident
+		else:
+			note = cabinet.last_error if not cabinet.last_error.is_empty() else "Inscribe failed."
+	_band_release()
+	_set_locked(false)
 	busy = false
 	_refresh_cache()
-	if not wrote:
-		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "Inscribe failed.")
-		return
-	var repaired: int = await cabinet.repair()
-	await _refresh_board()
-	if repaired < 0:
-		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "Repair failed.")
-		return
-	if repaired > 0:
-		_status("Aboard: %s. Repair added %d." % [str(item.get("identifier", "")), repaired])
+	if not note.is_empty():
+		_status(note)
 
 
+## Drawn in the game view, at the top. A ConfirmationDialog is its own window,
+## and the editor's embedded player does not show that window, so the click
+## looked like it did nothing.
 func _confirm(title: String, body: String, ok_text: String) -> bool:
-	var dialog := ConfirmationDialog.new()
-	dialog.title = title
-	dialog.dialog_text = body
-	dialog.dialog_autowrap = true
-	dialog.ok_button_text = ok_text
-	dialog.cancel_button_text = "LEAVE IT"
-	dialog.theme = theme
-	dialog.min_size = Vector2(520, 180)
-	add_child(dialog)
-	dialog.popup_centered()
-	var accepted := false
-	var settled := false
-	dialog.confirmed.connect(func() -> void:
-		accepted = true
-		settled = true
+	var dim := ColorRect.new()
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dim.color = Color(ArkTheme.INK, 0.78)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	dim.z_index = 40
+	add_child(dim)
+	var band := CenterContainer.new()
+	band.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dim.add_child(band)
+	band.set_anchors_preset(Control.PRESET_TOP_WIDE)
+	band.offset_top = 56
+	band.offset_bottom = 420
+	var panel := PanelContainer.new()
+	panel.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	panel.custom_minimum_size = Vector2(560, 0)
+	panel.add_theme_stylebox_override("panel", ArkTheme._box(ArkTheme.GOLD, ArkTheme.INK, 18, 16, 1))
+	band.add_child(panel)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 12)
+	panel.add_child(box)
+	var heading := ArkTheme.line(title, ArkTheme.GOLD, ArkTheme.SIZE_TITLE)
+	heading.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	box.add_child(heading)
+	var copy := ArkTheme.line(body, ArkTheme.PARCHMENT, ArkTheme.SIZE_BODY)
+	copy.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	copy.custom_minimum_size = Vector2(520, 0)
+	box.add_child(copy)
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_END
+	row.add_theme_constant_override("separation", 8)
+	box.add_child(row)
+	# A lambda cannot assign the outer bools. A dictionary is the shared gate.
+	var gate := {"ok": false, "done": false}
+	var cancel := ArkTheme.quiet_button("LEAVE IT", func() -> void:
+		gate["done"] = true
 	)
-	dialog.canceled.connect(func() -> void:
-		settled = true
+	var ok := ArkTheme.primary_button(ok_text, func() -> void:
+		gate["ok"] = true
+		gate["done"] = true
 	)
-	while not settled:
+	row.add_child(cancel)
+	row.add_child(ok)
+	ok.grab_focus()
+	while not bool(gate["done"]):
+		if Input.is_action_just_pressed("ui_cancel"):
+			break
 		await get_tree().process_frame
-	dialog.queue_free()
-	return accepted
+	dim.queue_free()
+	return bool(gate["ok"])
 
 
 func _apply_mirror() -> void:
@@ -1937,13 +2586,19 @@ func _open_aboard(entry: Dictionary) -> void:
 		_status("Reading this back needs GodOnChain.")
 		return
 	busy = true
-	_status("Reading %s from the chain." % ident)
+	_band_hold("Reading %s from the chain" % ident)
 	var cabinet := Cabinet.new(iq, chain)
-	var files: Array = await cabinet.file_list(ident)
+	var files: Array = await cabinet.file_list(ident, _band_tick)
+	_band_release()
 	busy = false
 	if files.is_empty():
 		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "No files aboard for %s." % ident)
 		return
+	var names := PackedStringArray()
+	for file in files:
+		if bool(file.get("aboard", false)):
+			names.append(str(file.get("name", "")))
+	_remember_aboard(ident, names)
 	item = {
 		"identifier": ident,
 		"title": str(entry.get("title", ident)),
@@ -1975,42 +2630,263 @@ func _repair_aboard() -> void:
 
 
 func _paint_featured(band: Array, kinds: Array) -> void:
-	if featured_box == null:
+	if featured_box == null or featured_row == null:
 		return
 	for child in featured_box.get_children():
 		child.queue_free()
 	if band.is_empty():
-		featured_box.visible = false
+		featured_row.visible = false
 		return
-	featured_box.visible = true
-	var heading := ArkTheme.line("Featured", ArkTheme.WATER, ArkTheme.SIZE_SMALL)
-	heading.autowrap_mode = TextServer.AUTOWRAP_OFF
-	featured_box.add_child(heading)
-	var ia_of := {}
-	for row in kinds:
-		if row is Dictionary:
-			ia_of[str((row as Dictionary).get("id", ""))] = str((row as Dictionary).get("ia", ""))
+	featured_row.visible = true
+	for view in Ark.featured_views(_manifest, kinds, _feature_totals(band, kinds), _grouping_files(band, kinds)):
+		featured_box.add_child(_featured_card(view))
+	_queue_collection_sizes(band, kinds)
+	_queue_grouping_files(band, kinds)
+
+
+func _feature_totals(band: Array, kinds: Array) -> Dictionary:
+	var totals := {}
 	for entry in band:
 		var slug := str(entry.get("slug", ""))
-		var title := str(entry.get("title", ""))
-		if title.is_empty():
-			title = slug
-		var ia := str(ia_of.get(slug, ""))
-		var members := Ark.merge_ids(Ark.kind_members(kinds, slug), Ark.load_walk(slug).get("members", []))
-		var aboard := 0
-		for ident in members:
-			if _aboard_ids.has(ident):
-				aboard += 1
-		var files := Ark.walk_file_counts(Ark.load_walk(slug))
-		var label := Ark.effort_label(
-			title,
-			aboard,
-			members.size(),
-			int(files.get("aboard", 0)),
-			int(files.get("total", 0)),
-			bool(files.get("known", false))
+		var ia := str(Ark.kind_header(kinds, slug).get("ia", "")).strip_edges()
+		if ia.is_empty() or totals.has(ia):
+			continue
+		var total := Ark.known_total(
+			Ark.published_total(str(entry.get("note", ""))),
+			int(Ark.load_walk(slug).get("total", -1)),
+			int(_collection_sizes.get(ia, -1))
 		)
-		featured_box.add_child(_featured_chip(label, title, ia, slug))
+		if total > 0:
+			totals[ia] = total
+	return totals
+
+
+func _queue_collection_sizes(band: Array, kinds: Array) -> void:
+	for entry in band:
+		var slug := str(entry.get("slug", ""))
+		var ia := str(Ark.kind_header(kinds, slug).get("ia", "")).strip_edges()
+		if ia.is_empty() or _collection_sizes.has(ia) or _collection_peeking.has(ia):
+			continue
+		_collection_peeking[ia] = true
+		_collection_queue.append(ia)
+	if _collection_draining or _collection_queue.is_empty():
+		return
+	_collection_draining = true
+	_drain_collection_sizes()
+
+
+func _drain_collection_sizes() -> void:
+	while not _collection_queue.is_empty():
+		var ia := str(_collection_queue.pop_front())
+		var total := await _collection_total(ia)
+		_collection_peeking.erase(ia)
+		if total <= 0 or int(_collection_sizes.get(ia, -1)) == total:
+			continue
+		_collection_sizes[ia] = total
+		if featured_box != null:
+			_paint_featured(Ark.featured_band(_kind_rows), _kind_rows)
+	_collection_draining = false
+	if not _collection_queue.is_empty():
+		_collection_draining = true
+		_drain_collection_sizes()
+
+
+func _collection_total(ia: String) -> int:
+	var body := await _peek_text(Archive.scrape_url(Archive.member_query(ia), "", 1))
+	var page := Archive.parse_scrape(body)
+	if not bool(page.get("ok", false)) or not bool(page.get("total_known", false)):
+		return -1
+	var total := int(page.get("total", 0))
+	return total if total > 0 else -1
+
+
+func _peek_text(url: String) -> String:
+	var http := HTTPRequest.new()
+	http.timeout = 25.0
+	add_child(http)
+	var err := http.request(url, PackedStringArray(["User-Agent: %s" % Archive.USER_AGENT]))
+	if err != OK:
+		http.queue_free()
+		return ""
+	var result: Array = await http.request_completed
+	var body := ""
+	if (
+		result.size() >= 4
+		and int(result[0]) == HTTPRequest.RESULT_SUCCESS
+		and int(result[1]) == 200
+	):
+		body = (result[3] as PackedByteArray).get_string_from_utf8()
+	http.queue_free()
+	return body
+
+
+func _grouping_files(band: Array, kinds: Array) -> Dictionary:
+	var out := {}
+	for entry in band:
+		var slug := str(entry.get("slug", ""))
+		var ident := Ark.item_effort_member(kinds, slug)
+		if ident.is_empty():
+			continue
+		if _item_files.has(slug) and bool((_item_files[slug] as Dictionary).get("known", false)):
+			out[slug] = _item_files[slug]
+			continue
+		var walked := _walk_grouping_files(slug, ident)
+		if not walked.is_empty():
+			out[slug] = walked
+			continue
+		var published := Ark.published_file_total(str(entry.get("note", "")))
+		if published > 0:
+			out[slug] = {"member": ident, "aboard": 0, "total": published, "known": false}
+	return out
+
+
+func _walk_grouping_files(slug: String, ident: String) -> Dictionary:
+	var files: Variant = Ark.load_walk(slug).get("files", {})
+	if not files is Dictionary or not (files as Dictionary).has(ident):
+		return {}
+	var row: Dictionary = (files as Dictionary)[ident]
+	var total := int(row.get("total", 0))
+	if total <= 0:
+		return {}
+	return {
+		"member": ident,
+		"aboard": int(row.get("aboard", 0)),
+		"total": total,
+		"known": true,
+	}
+
+
+func _queue_grouping_files(band: Array, kinds: Array) -> void:
+	if iq == null or not iq.is_available():
+		return
+	for entry in band:
+		var slug := str(entry.get("slug", ""))
+		var ident := Ark.item_effort_member(kinds, slug)
+		if ident.is_empty() or _item_file_peeking.has(slug):
+			continue
+		if _item_files.has(slug) and bool((_item_files[slug] as Dictionary).get("known", false)):
+			continue
+		_item_file_peeking[slug] = true
+		_item_file_queue.append({"slug": slug, "member": ident})
+	if _item_file_draining or _item_file_queue.is_empty():
+		return
+	_item_file_draining = true
+	_drain_grouping_files()
+
+
+func _drain_grouping_files() -> void:
+	var epoch := _file_epoch
+	while not _item_file_queue.is_empty():
+		if epoch != _file_epoch:
+			break
+		var job: Dictionary = _item_file_queue.pop_front()
+		var slug := str(job.get("slug", ""))
+		var ident := str(job.get("member", ""))
+		var gen := int(_item_file_gen.get(slug, 0))
+		var published := 0
+		for mark in Ark.featured_band(_kind_rows):
+			if str(mark.get("slug", "")) == slug:
+				published = Ark.published_file_total(str(mark.get("note", "")))
+				break
+		var report := await _tally_grouping(ident, published)
+		# A chain switch or a fresh inscribe queues a newer tally. Leave that
+		# job, and its peeking flag, for the drain that owns the new epoch.
+		if epoch != _file_epoch or gen != int(_item_file_gen.get(slug, 0)):
+			break
+		_item_file_peeking.erase(slug)
+		if not bool(report.get("known", false)):
+			continue
+		report["member"] = ident
+		var prev: Dictionary = _item_files.get(slug, {})
+		_item_files[slug] = report
+		var same := (
+			bool(prev.get("known", false))
+			and int(prev.get("aboard", -1)) == int(report.get("aboard", 0))
+			and int(prev.get("total", -1)) == int(report.get("total", 0))
+		)
+		if same or featured_box == null:
+			continue
+		_paint_featured(Ark.featured_band(_kind_rows), _kind_rows)
+	_item_file_draining = false
+	if not _item_file_queue.is_empty():
+		_item_file_draining = true
+		_drain_grouping_files()
+
+
+## The numerator is files already complete on the chain. The denominator is
+## the original count on the feature mark, or a name list already in hand.
+## A live Archive fetch is not part of this: the mark was written when the
+## item was featured, and a down Archive must not hold the fraction back.
+func _tally_grouping(ident: String, published: int) -> Dictionary:
+	if iq == null or not iq.is_available():
+		return {"known": false}
+	var problem: Array = []
+	var rows: Array = await Cabinet.new(iq, chain).item_rows(ident, problem)
+	if not problem.is_empty():
+		return {"known": false}
+	var names := PackedStringArray()
+	var loaded := _names_already_in_hand(ident)
+	if bool(loaded.get("ok", false)):
+		names = loaded.get("names", PackedStringArray())
+	return Ark.grouping_files(rows, published, names)
+
+
+## Cached names, or the open Archive page. Nothing here touches the network.
+func _names_already_in_hand(ident: String) -> Dictionary:
+	if _original_name_cache.has(ident):
+		var cached: PackedStringArray = _original_name_cache[ident]
+		if not cached.is_empty():
+			return {"ok": true, "names": cached}
+	if str(item.get("identifier", "")) == ident and not bool(item.get("from_chain", false)):
+		var staged := Archive.original_names(item.get("files", []))
+		if not staged.is_empty():
+			_original_name_cache[ident] = staged
+			return {"ok": true, "names": staged}
+	return {"ok": false, "names": PackedStringArray()}
+
+
+func _load_original_names(ident: String) -> Dictionary:
+	var held := _names_already_in_hand(ident)
+	if bool(held.get("ok", false)):
+		return held
+	var body := await _peek_text(Archive.metadata_url(ident))
+	if body.is_empty():
+		return {"ok": false, "names": PackedStringArray()}
+	var parsed := Archive.parse_metadata(body)
+	var names := Archive.original_names(parsed.get("files", []))
+	# An outage page is not a real empty item. Leave the mark's count in place.
+	if names.is_empty() or str(parsed.get("identifier", "")).is_empty():
+		return {"ok": false, "names": PackedStringArray()}
+	_original_name_cache[ident] = names
+	return {"ok": true, "names": names}
+
+
+func _remember_grouping_tally(slug: String, files: Dictionary) -> void:
+	var ident := Ark.item_effort_member(_kind_rows, slug)
+	if ident.is_empty() or not files.has(ident):
+		return
+	var row: Dictionary = files[ident]
+	var total := int(row.get("total", 0))
+	if total <= 0:
+		return
+	_item_files[slug] = {
+		"member": ident,
+		"aboard": int(row.get("aboard", 0)),
+		"total": total,
+		"known": true,
+	}
+
+
+func _forget_grouping_files(ident: String) -> void:
+	var drop: Array = []
+	for slug in _item_files:
+		var row: Dictionary = _item_files[slug]
+		if str(row.get("member", "")) == ident:
+			drop.append(slug)
+	for slug in drop:
+		_item_files.erase(slug)
+		_item_file_gen[slug] = int(_item_file_gen.get(slug, 0)) + 1
+		_item_file_peeking.erase(slug)
 
 
 func _toggle_derivatives(on: bool) -> void:
@@ -2142,19 +3018,18 @@ func _ask_kind() -> Dictionary:
 	box.add_child(members)
 	add_child(dialog)
 	dialog.popup_centered()
-	var accepted := false
-	var settled := false
+	var gate := {"ok": false, "done": false}
 	dialog.confirmed.connect(func() -> void:
-		accepted = true
-		settled = true
+		gate["ok"] = true
+		gate["done"] = true
 	)
 	dialog.canceled.connect(func() -> void:
-		settled = true
+		gate["done"] = true
 	)
-	while not settled:
+	while not bool(gate["done"]):
 		await get_tree().process_frame
 	var result := {}
-	if accepted:
+	if bool(gate["ok"]):
 		result = {
 			"title": title_edit.text.strip_edges(),
 			"ia": ia_edit.text.strip_edges(),
@@ -2189,18 +3064,34 @@ func _feature_item() -> void:
 		if not existing.is_empty():
 			title = existing
 	if listed and Ark.latest_state(_kind_rows, slug) == "featured":
-		_status("Already featured.")
+		_status("%s is on the featured band." % title)
+		_item_files.erase(slug)
+		_item_file_gen[slug] = int(_item_file_gen.get(slug, 0)) + 1
+		_item_file_peeking.erase(slug)
+		_paint_featured(Ark.featured_band(_kind_rows), _kind_rows)
 		return
-	var body := "This writes a small mark on %s. The host will ask. Anyone can feature or finish the shelf later." % title
+	var body := "This puts %s on the featured band. Everyone sees how many of its files are aboard. The host will ask." % title
 	if create:
-		body = "This files %s as an effort and puts this item on the shelf, then writes a featured mark. The host will ask for each row." % title
+		body = "This files %s as an effort and puts it on the featured band. Everyone sees how many of its files are aboard. The host will ask for each row." % title
 	elif not listed:
-		body = "This adds this item to %s and writes a featured mark. The host will ask." % title
-	var proceed: bool = await _confirm("Feature this item", body, "FEATURE")
+		body = "This adds this item to %s and writes a featured mark. Everyone sees how many of its files are aboard. The host will ask." % title
+	var proceed: bool = await _confirm("Feature this archive", body, "FEATURE")
 	if not proceed:
 		_status("Feature cancelled.")
 		return
 	busy = true
+	var file_total := 0
+	if not bool(item.get("from_chain", false)):
+		file_total = Archive.original_names(item.get("files", [])).size()
+	if file_total <= 0:
+		_status("Counting files in %s." % title)
+		var loaded := await _load_original_names(ident)
+		if bool(loaded.get("ok", false)):
+			var names: PackedStringArray = loaded.get("names", PackedStringArray())
+			file_total = names.size()
+	elif not _original_name_cache.has(ident):
+		_original_name_cache[ident] = Archive.original_names(item.get("files", []))
+	var note := "f:%d" % file_total if file_total > 0 else ""
 	var cabinet := Cabinet.new(iq, chain)
 	if create and not await cabinet.ensure_kind(slug, title, ""):
 		busy = false
@@ -2210,7 +3101,7 @@ func _feature_item() -> void:
 		busy = false
 		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "The item was not filed.")
 		return
-	if not await cabinet.write_mark(slug, title, "featured"):
+	if not await cabinet.write_mark(slug, title, "featured", note):
 		busy = false
 		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "The mark was not written.")
 		return
@@ -2233,6 +3124,7 @@ func _feature_current() -> void:
 	if not kind_slug.is_empty():
 		slug = kind_slug
 		title = kind_title if not kind_title.is_empty() else kind_slug
+		ia = str(Ark.kind_header(_kind_rows, slug).get("ia", "")).strip_edges()
 	elif not collection_id.is_empty():
 		var existing := Ark.kind_for_ia(_kind_rows, collection_id)
 		if existing.is_empty():
@@ -2245,6 +3137,9 @@ func _feature_current() -> void:
 			title = str(existing.get("title", ""))
 			if title.is_empty():
 				title = collection_title
+			ia = str(existing.get("ia", "")).strip_edges()
+			if ia.is_empty():
+				ia = collection_id
 	else:
 		_status("Open a collection or a kind to feature it.")
 		return
@@ -2253,19 +3148,26 @@ func _feature_current() -> void:
 		return
 	var proceed: bool = await _confirm(
 		"Feature this effort",
-		"This writes a small mark on %s. The host will ask. Anyone can feature or finish the shelf later." % title,
+		"This puts %s on the featured band, beside any collection already there. Everyone reading this chain sees how much of it is aboard. The host will ask." % title,
 		"FEATURE"
 	)
 	if not proceed:
 		_status("Feature cancelled.")
 		return
 	busy = true
+	var total_note := ""
+	if not ia.is_empty():
+		_status("Counting %s." % title)
+		var learned := await _collection_total(ia)
+		if learned > 0:
+			total_note = str(learned)
+			_collection_sizes[ia] = learned
 	var cabinet := Cabinet.new(iq, chain)
 	if create and not await cabinet.ensure_kind(slug, title, ia):
 		busy = false
 		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "The shelf was not filed.")
 		return
-	if not await cabinet.write_mark(slug, title, "featured"):
+	if not await cabinet.write_mark(slug, title, "featured", total_note):
 		busy = false
 		_status(cabinet.last_error if not cabinet.last_error.is_empty() else "The mark was not written.")
 		return
@@ -2307,7 +3209,10 @@ func _check_current() -> void:
 			_status("The Archive did not answer. The effort stays featured.")
 			return
 		var found: PackedStringArray = page.get("items", PackedStringArray())
-		state = Ark.walk_add(state, found, str(page.get("cursor", "")), bool(page.get("finished", false)))
+		var learned := int(page.get("total", 0)) if bool(page.get("total_known", false)) else -1
+		state = Ark.walk_add(state, found, str(page.get("cursor", "")), bool(page.get("finished", false)), learned)
+		if learned > 0:
+			_collection_sizes[ia] = learned
 	var members := explicit
 	if not ia.is_empty():
 		members = Ark.merge_ids(explicit, state.get("members", []))
@@ -2345,20 +3250,29 @@ func _check_current() -> void:
 	state["complete"] = complete
 	state["files"] = files
 	Ark.save_walk(slug, state)
+	_remember_grouping_tally(slug, files)
 	var counts := Ark.walk_file_counts(state)
 	if not reachable:
 		busy = false
 		await _refresh_board()
 		_status("The Archive did not answer. The effort stays featured.")
 		return
-	if not Ark.should_finish(members, complete, true, bool(state.get("finished", false))):
+	var full := int(state.get("total", -1))
+	var span := full if not ia.is_empty() else -1
+	if not Ark.should_finish(members, complete, true, bool(state.get("finished", false)), span):
 		busy = false
 		await _refresh_board()
-		var note := "Checked %s. %d/%d aboard." % [title, _aboard_items(members, complete), members.size()]
-		if bool(counts.get("known", false)):
+		var denom := members.size()
+		if span > denom:
+			denom = span
+		var note := "Checked %s. %d/%d aboard." % [title, _aboard_items(members, complete), denom]
+		var covered := span <= members.size()
+		if bool(counts.get("known", false)) and covered:
 			note += " %d/%d files." % [int(counts.get("aboard", 0)), int(counts.get("total", 0))]
 		if not ia.is_empty() and not bool(state.get("finished", false)):
 			note += " CHECK continues the walk."
+		elif span > members.size():
+			note += " The Archive lists more items than this walk gathered. The effort stays featured."
 		_status(note)
 		return
 	var proceed: bool = await _confirm(
@@ -2446,17 +3360,19 @@ func _paint_file_states() -> void:
 		return
 	var identifier := str(item.get("identifier", ""))
 	for row in file_tree.get_root().get_children():
-		var at := int(row.get_metadata(FILE_COL_NAME))
+		var at := _row_file(row)
+		if at < 0:
+			continue
 		var name := str((stage_files[at] as Dictionary).get("name", ""))
+		if _file_aboard(name):
+			row.set_text(FILE_COL_STATE, "aboard")
+			row.set_custom_color(FILE_COL_STATE, ArkTheme.LAMP)
+			row.set_tooltip_text(FILE_COL_STATE, "Already on this chain.")
+			continue
 		var cached := not cache.sha_for(identifier, name).is_empty()
 		row.set_text(FILE_COL_STATE, "cached" if cached else "")
 		row.set_custom_color(FILE_COL_STATE, ArkTheme.WATER)
 		row.set_tooltip_text(FILE_COL_STATE, "Already on this machine. OPEN is instant." if cached else "")
-
-
-func _on_progress(received: int) -> void:
-	var prefix := _progress_note if not _progress_note.is_empty() else "Downloading"
-	_status("%s…  %s" % [prefix, _human_bytes(received)])
 
 
 func _get_text(url: String) -> String:
@@ -2474,7 +3390,57 @@ func _get_text(url: String) -> String:
 
 
 func _status(text: String) -> void:
+	if _band_call == -1:
+		_progress_note = text
+		_paint_band(int(band_bar.value))
+		return
 	status_label.text = text
+
+
+## Covers the window for the length of an inscription. The progress band stays
+## above the shade so the fraction remains readable. There is no cancel.
+func _set_locked(on: bool) -> void:
+	_locked = on
+	if on and _lock_shade == null:
+		_lock_shade = ColorRect.new()
+		_lock_shade.name = "WorkLock"
+		_lock_shade.set_anchors_preset(Control.PRESET_FULL_RECT)
+		_lock_shade.color = Color(ArkTheme.INK, 0.45)
+		_lock_shade.mouse_filter = Control.MOUSE_FILTER_STOP
+		_lock_shade.z_as_relative = false
+		_lock_shade.z_index = 20
+		add_child(_lock_shade)
+	if _lock_shade != null:
+		_lock_shade.visible = on
+	if band_stack != null:
+		# Absolute only while the shade is up, so the band sits above it.
+		# Afterwards it returns to ordinary stacking with the rest of the window.
+		band_stack.z_as_relative = not on
+		band_stack.z_index = 40 if on else 0
+	if band_cancel != null:
+		band_cancel.visible = false
+	_sync_actions()
+
+
+## When the open Archive item is already on the manifest, learn which of its
+## files are complete so INSCRIBE is not offered for them.
+func _peek_aboard_names() -> void:
+	var ident := str(item.get("identifier", ""))
+	if ident.is_empty() or bool(item.get("from_chain", false)):
+		return
+	if not _aboard_ids.has(ident) or _aboard_names.has(ident):
+		return
+	if iq == null or not iq.is_available():
+		return
+	_aboard_peek += 1
+	var token := _aboard_peek
+	var names := await Cabinet.new(iq, chain).aboard_names(ident)
+	if token != _aboard_peek or str(item.get("identifier", "")) != ident:
+		return
+	_remember_aboard(ident, names)
+	_paint_file_states()
+	_quote()
+	_sync_actions()
 
 
 func _human_bytes(n: int) -> String:

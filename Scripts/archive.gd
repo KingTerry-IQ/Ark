@@ -76,6 +76,18 @@ static func originals(files: Array) -> Array:
 	return out
 
 
+static func original_names(files: Array) -> PackedStringArray:
+	var out := PackedStringArray()
+	var seen := {}
+	for file in originals(files):
+		var name := str(file.get("name", "")).strip_edges()
+		if name.is_empty() or seen.has(name):
+			continue
+		seen[name] = true
+		out.append(name)
+	return out
+
+
 ## The Archive download list groups by format, then by folder, then by name.
 static func file_section(file: Dictionary) -> String:
 	var format := str(file.get("format", "")).strip_edges()
@@ -92,6 +104,54 @@ static func file_folder(name: String) -> String:
 	if slash <= 0:
 		return ""
 	return name.substr(0, slash)
+
+
+## The download listing as folders, the way archive.org/download/ pages it.
+## Keyed by folder path, "" is the item root. Each entry holds its child
+## folder paths, the indices of the files directly in it, the indices of
+## every file beneath it, and the bytes beneath it.
+static func folder_index(files: Array) -> Dictionary:
+	var index := {}
+	_ensure_folder(index, "")
+	for at in files.size():
+		var file: Variant = files[at]
+		if not file is Dictionary:
+			continue
+		var folder := file_folder(str(file.get("name", "")))
+		_ensure_folder(index, folder)
+		(index[folder]["files"] as Array).append(at)
+		var bytes := Ark.file_bytes(file)
+		var walk := folder
+		while true:
+			var entry: Dictionary = index[walk]
+			(entry["all"] as Array).append(at)
+			entry["bytes"] = int(entry["bytes"]) + bytes
+			if walk.is_empty():
+				break
+			walk = file_folder(walk)
+	for path in index:
+		(index[path]["dirs"] as Array).sort_custom(func(a: String, b: String) -> bool:
+			return a.nocasecmp_to(b) < 0
+		)
+	return index
+
+
+static func _ensure_folder(index: Dictionary, path: String) -> void:
+	if index.has(path):
+		return
+	index[path] = {"dirs": [], "files": [], "all": [], "bytes": 0}
+	if path.is_empty():
+		return
+	var parent := file_folder(path)
+	_ensure_folder(index, parent)
+	(index[parent]["dirs"] as Array).append(path)
+
+
+## A file's name as seen from inside a folder of the listing.
+static func relative_to(name: String, folder: String) -> String:
+	if folder.is_empty() or not name.begins_with(folder + "/"):
+		return name
+	return name.substr(folder.length() + 1)
 
 
 static func arrange_files(files: Array) -> Array:
@@ -225,7 +285,7 @@ static func scrape_url(query: String, cursor: String = "", count: int = SCRAPE_C
 static func parse_scrape(body: String) -> Dictionary:
 	var parsed: Variant = JSON.parse_string(body)
 	if not parsed is Dictionary:
-		return {"ok": false, "items": PackedStringArray(), "cursor": "", "total": 0, "finished": false}
+		return {"ok": false, "items": PackedStringArray(), "cursor": "", "total": 0, "finished": false, "total_known": false}
 	var doc: Dictionary = parsed
 	var items := PackedStringArray()
 	var listed: Variant = doc.get("items", [])
@@ -242,11 +302,16 @@ static func parse_scrape(body: String) -> Dictionary:
 	if cursor_value != null:
 		cursor = str(cursor_value).strip_edges()
 		finished = cursor.is_empty()
+	var total_known := doc.has("total")
+	var total := items.size()
+	if total_known:
+		total = int(doc.get("total", items.size()))
 	return {
 		"ok": true,
 		"items": items,
 		"cursor": cursor,
-		"total": int(doc.get("total", items.size())),
+		"total": total,
+		"total_known": total_known,
 		"finished": finished,
 	}
 
@@ -477,6 +542,42 @@ static func extension_of(filename: String) -> String:
 	if dot < 0:
 		return ""
 	return base.substr(dot + 1)
+
+
+const _RESERVED_NAMES := [
+	"CON", "PRN", "AUX", "NUL",
+	"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+	"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+]
+const LOCAL_NAME_MAX := 120
+
+
+## An Archive file name as one this machine can write. Archive names carry
+## characters Windows refuses (a mail timestamp's colons, a quote, a "?"),
+## Windows device names, and lengths that blow past MAX_PATH once they sit
+## in the cache. The extension survives, so players still know the file.
+static func local_name(filename: String) -> String:
+	var base := filename.get_file()
+	var out := ""
+	for i in base.length():
+		var c := base[i]
+		if c in ["<", ">", ":", "\"", "/", "\\", "|", "?", "*"] or base.unicode_at(i) < 32:
+			out += "_"
+		else:
+			out += c
+	out = out.strip_edges().rstrip(". ")
+	if out.is_empty():
+		return "file"
+	var stem := out.get_slice(".", 0).to_upper()
+	if stem in _RESERVED_NAMES:
+		out = "_" + out
+	if out.length() > LOCAL_NAME_MAX:
+		var ext := extension_of(out)
+		var keep := LOCAL_NAME_MAX - (ext.length() + 1 if not ext.is_empty() and ext.length() < 16 else 0)
+		out = out.substr(0, keep).rstrip(". ")
+		if not ext.is_empty() and ext.length() < 16:
+			out += "." + ext
+	return out
 
 
 static func basename_of(filename: String) -> String:

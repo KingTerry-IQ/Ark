@@ -22,6 +22,8 @@ func _run() -> void:
 	_fees()
 	_archive()
 	_featured()
+	_collection_progress()
+	_grouping_progress()
 	_cache()
 	_look()
 	_aboard()
@@ -150,6 +152,22 @@ func _archive() -> void:
 	_check("metadata has two collections", (item["collections"] as PackedStringArray).size() == 2)
 	var visible: Array = Archive.originals(item["files"])
 	_check("originals keep the video and the subtitle", visible.size() == 2)
+	var named := Archive.original_names(item["files"])
+	_check(
+		"original names keep the video and the subtitle",
+		named.size() == 2 and named.has("talk.mp4") and named.has("talk.en.vtt")
+	)
+	var duped := Archive.original_names([
+		{"name": "talk.mp4", "source": "original"},
+		{"name": "talk.mp4", "source": "original"},
+		{"name": "__ia_thumb.jpg", "source": "original"},
+		{"name": " talk.en.vtt ", "source": "original"},
+		{"name": "", "source": "original"},
+	])
+	_check(
+		"original names skip hidden files and repeats",
+		duped == PackedStringArray(["talk.mp4", "talk.en.vtt"])
+	)
 	var names: PackedStringArray = []
 	for file in visible:
 		names.append(str(file["name"]))
@@ -173,6 +191,38 @@ func _archive() -> void:
 	)
 	_check("a folder is the path above the file", Archive.file_folder("dir/a.mp4") == "dir")
 	_check("a root file has no folder", Archive.file_folder("b.mp4") == "")
+	var tree_files: Array = [
+		{"name": "readme.txt", "size": "10"},
+		{"name": "videos/2015/a.mp4", "size": "100"},
+		{"name": "videos/b.mp4", "size": "200"},
+		{"name": "images/x.png", "size": "5"},
+	]
+	var folders: Dictionary = Archive.folder_index(tree_files)
+	_check("root lists its folders by name", folders[""]["dirs"] == ["images", "videos"])
+	_check("root holds only its own files", folders[""]["files"] == [0])
+	_check("root counts every file", (folders[""]["all"] as Array).size() == 4)
+	_check("root sums every byte", int(folders[""]["bytes"]) == 315)
+	_check("a nested folder is listed", folders["videos"]["dirs"] == ["videos/2015"])
+	_check("a folder counts files beneath it", (folders["videos"]["all"] as Array).size() == 2)
+	_check("a folder sums bytes beneath it", int(folders["videos"]["bytes"]) == 300)
+	_check("a leaf folder holds its file", folders["videos/2015"]["files"] == [1])
+	_check("a flat item is one folder", Archive.folder_index([{"name": "a"}]).size() == 1)
+	_check("relative name drops the folder", Archive.relative_to("videos/2015/a.mp4", "videos") == "2015/a.mp4")
+	_check("relative name at the root is whole", Archive.relative_to("videos/b.mp4", "") == "videos/b.mp4")
+	_check(
+		"a mail timestamp writes on Windows",
+		Archive.local_name("email/x/2018-08-11T11:13:57-0700 - Rose to throne?.eml")
+		== "2018-08-11T11_13_57-0700 - Rose to throne_.eml"
+	)
+	_check("quotes write on Windows", Archive.local_name("a/\"You know\" quote.jpeg") == "_You know_ quote.jpeg")
+	_check("a plain name is untouched", Archive.local_name("videos/talk.mp4") == "talk.mp4")
+	_check("a device name is not a device", Archive.local_name("nul.txt") == "_nul.txt")
+	_check("trailing dots are dropped", Archive.local_name("notes. ") == "notes")
+	_check("an empty name still names a file", Archive.local_name("???").length() > 0 and Archive.local_name("") == "file")
+	var long_name := Archive.local_name("x".repeat(400) + ".mhtml")
+	_check("a long name is cut", long_name.length() == Archive.LOCAL_NAME_MAX)
+	_check("a long name keeps its extension", long_name.ends_with(".mhtml"))
+	_check("relative name needs a whole segment", Archive.relative_to("videosx/b.mp4", "videos") == "videosx/b.mp4")
 	_check("format is the section", Archive.file_section(mixed[0]) == "MPEG4")
 	_check("a missing format uses the extension", Archive.file_section({"name": "note.txt"}) == "TXT")
 	_check("mp4 opens as video", Archive.open_kind("talk.mp4") == "video")
@@ -309,6 +359,221 @@ func _featured() -> void:
 	_check("empty kind is not complete", not Ark.effort_is_complete(PackedStringArray(), {}, true))
 
 
+func _collection_progress() -> void:
+	var kinds: Array = [
+		Ark.kind_header_row("prelinger", "Prelinger", "prelinger", ""),
+		Ark.mark_row("prelinger", "Prelinger", 1000, "featured", "10"),
+		Ark.kind_header_row("nasa", "NASA", "nasa", ""),
+		Ark.mark_row("nasa", "NASA", 2000, "featured", "4"),
+		Ark.kind_header_row("terry", "Terry", "", ""),
+		Ark.kind_member_row("terry", "Terry", "one"),
+		Ark.kind_member_row("terry", "Terry", "two"),
+		Ark.mark_row("terry", "Terry", 3000, "featured"),
+	]
+	var manifest: Array = [
+		{"id": "a", "identifier": "a", "collections": "prelinger, nasa"},
+		{"id": "a", "identifier": "a", "title": "dup", "collections": "prelinger"},
+		{"id": "b", "identifier": "b", "collections": "prelinger"},
+		{"id": "c", "identifier": "c", "collections": "nasaimages"},
+		{"id": "one", "identifier": "one", "collections": ""},
+		{"id": "d", "identifier": "d", "collections": " nasa "},
+	]
+	var totals := {"prelinger": 10, "nasa": 4}
+	var views := Ark.featured_views(manifest, kinds, totals)
+	_check("three efforts stay on the band", views.size() == 3)
+	_check("oldest collection is still first", str(views[0].get("slug", "")) == "prelinger")
+	var pre := _view(views, "prelinger")
+	_check(
+		"prelinger counts inscribed items once",
+		int(pre.get("aboard", 0)) == 2 and int(pre.get("total", 0)) == 10 and bool(pre.get("known", false))
+	)
+	var nasa := _view(views, "nasa")
+	_check(
+		"nasa does not take nasaimages",
+		int(nasa.get("aboard", 0)) == 2 and int(nasa.get("total", 0)) == 4
+	)
+	var terry := _view(views, "terry")
+	_check(
+		"a shelf counts members that are aboard",
+		int(terry.get("aboard", 0)) == 1 and int(terry.get("total", 0)) == 2 and bool(terry.get("known", false))
+	)
+	var unknown := _view(Ark.featured_views(manifest, kinds, {}), "prelinger")
+	_check(
+		"a collection without a size is not shown as finished",
+		not bool(unknown.get("known", false)) and int(unknown.get("aboard", 0)) == 2
+	)
+	var raised := Ark.effort_progress(manifest, kinds, "prelinger", "prelinger", 1)
+	_check(
+		"aboard past the published size widens it",
+		int(raised.get("total", 0)) == 2 and bool(raised.get("known", false))
+	)
+	var band := Ark.featured_band(kinds)
+	var noted := {}
+	for entry in band:
+		noted[str(entry.get("slug", ""))] = str(entry.get("note", ""))
+	_check("the feature mark keeps the size", str(noted.get("prelinger", "")) == "10")
+	_check("the mark publishes the collection size", Ark.published_total("10") == 10)
+	_check("a blank mark publishes no size", Ark.published_total("") == -1)
+	_check("prose is not a collection size", Ark.published_total("soon") == -1)
+	_check("a peek beats a walked total", Ark.known_total(10, 8, 12) == 12)
+	_check("a walk beats a published size", Ark.known_total(10, 8, -1) == 8)
+	_check("a published size is the fallback", Ark.known_total(10, -1, -1) == 10)
+	var walk := Ark.walk_add({}, PackedStringArray(["a"]), "next", false, 10)
+	_check(
+		"a walk records the collection size",
+		int(walk.get("total", 0)) == 10 and not bool(walk.get("finished", true))
+	)
+	var kept := Ark.walk_add({"total": 10, "members": ["a"]}, PackedStringArray(["b"]), "", true)
+	var kept_members: PackedStringArray = kept.get("members", PackedStringArray())
+	_check(
+		"a later page keeps the collection size",
+		int(kept.get("total", 0)) == 10 and bool(kept.get("finished", false)) and kept_members.size() == 2
+	)
+	var done_members := PackedStringArray(["a", "b"])
+	var done_map := {"a": true, "b": true}
+	_check(
+		"a short walk does not finish a larger collection",
+		not Ark.should_finish(done_members, done_map, true, true, 10)
+	)
+	_check(
+		"a full walk can finish",
+		Ark.should_finish(done_members, done_map, true, true, 2)
+	)
+	kinds.append(Ark.mark_row("nasa", "NASA", 4000, "done"))
+	var after := Ark.featured_views(manifest, kinds, totals)
+	_check("done takes a collection off the band", _view(after, "nasa").is_empty() and after.size() == 2)
+	var zero := Ark.featured_views([], kinds.slice(0, 2), {"prelinger": 10})
+	var bare := _view(zero, "prelinger")
+	_check(
+		"an empty collection still shows its size",
+		int(bare.get("aboard", 0)) == 0 and int(bare.get("total", 0)) == 10 and bool(bare.get("known", false))
+	)
+
+
+func _grouping_progress() -> void:
+	var channel := "TerryADavisTempleOSYouTubeChannelArchive"
+	var title := "TempleOS"
+	var slug := Ark.slug_for(title, channel)
+	var kinds: Array = [
+		Ark.kind_header_row("prelinger", "Prelinger", "prelinger", ""),
+		Ark.mark_row("prelinger", "Prelinger", 1000, "featured", "10"),
+		Ark.kind_header_row(slug, title, "", ""),
+		Ark.kind_member_row(slug, title, channel),
+		Ark.mark_row(slug, title, 1500, "featured", "f:320"),
+		Ark.kind_header_row("terry", "Terry", "", ""),
+		Ark.kind_member_row("terry", "Terry", "one"),
+		Ark.kind_member_row("terry", "Terry", "two"),
+		Ark.mark_row("terry", "Terry", 3000, "featured"),
+	]
+	_check("a grouping is its one item", Ark.item_effort_member(kinds, slug) == channel)
+	_check("a two-member shelf is not a grouping", Ark.item_effort_member(kinds, "terry") == "")
+	_check("a collection is not a grouping", Ark.item_effort_member(kinds, "prelinger") == "")
+	_check("an unknown shelf is not a grouping", Ark.item_effort_member(kinds, "missing") == "")
+	_check("a file mark publishes the original count", Ark.published_file_total("f:320") == 320)
+	_check("an item count is not a file count", Ark.published_file_total("10") == -1)
+	_check("a file mark is not an item count", Ark.published_total("f:320") == -1)
+	_check("a blank file mark publishes nothing", Ark.published_file_total("") == -1)
+	_check("a zero file mark publishes nothing", Ark.published_file_total("f:0") == -1)
+	var manifest: Array = [
+		{"id": channel, "identifier": channel, "collections": ""},
+		{"id": "a", "identifier": "a", "collections": "prelinger"},
+	]
+	var files := {
+		slug: {"aboard": 14, "total": 320, "known": true},
+	}
+	var views := Ark.featured_views(manifest, kinds, {"prelinger": 10}, files)
+	_check("a grouping stays beside the collections", views.size() == 3)
+	_check("oldest effort is still first", str(views[0].get("slug", "")) == "prelinger")
+	var group := _view(views, slug)
+	_check(
+		"a grouping reports files aboard",
+		str(group.get("member", "")) == channel
+		and int(group.get("files_aboard", 0)) == 14
+		and int(group.get("files_total", 0)) == 320
+		and bool(group.get("files_known", false))
+	)
+	_check(
+		"a grouping still knows its one item is aboard",
+		int(group.get("aboard", 0)) == 1 and int(group.get("total", 0)) == 1 and bool(group.get("known", false))
+	)
+	var pending := _view(Ark.featured_views(manifest, kinds, {"prelinger": 10}), slug)
+	_check(
+		"a grouping without a tally is not a finished file bar",
+		str(pending.get("member", "")) == channel
+		and not bool(pending.get("files_known", true))
+		and int(pending.get("files_total", -1)) == 0
+		and int(pending.get("files_aboard", -1)) == 0
+	)
+	var published := {
+		slug: {"member": channel, "aboard": 0, "total": 320, "known": false},
+	}
+	var waiting := _view(Ark.featured_views(manifest, kinds, {}, published), slug)
+	_check(
+		"a published file count waits for the chain tally",
+		not bool(waiting.get("files_known", true))
+		and int(waiting.get("files_total", 0)) == 320
+		and int(waiting.get("files_aboard", -1)) == 0
+	)
+	var pre := _view(views, "prelinger")
+	_check(
+		"a collection does not borrow a grouping's files",
+		str(pre.get("member", "x")) == ""
+		and not bool(pre.get("files_known", true))
+		and int(pre.get("total", 0)) == 10
+	)
+	var terry := _view(views, "terry")
+	_check("a multi-item shelf is not a grouping", str(terry.get("member", "x")) == "")
+	var noted := {}
+	for entry in Ark.featured_band(kinds):
+		noted[str(entry.get("slug", ""))] = str(entry.get("note", ""))
+	_check("the grouping mark keeps the file count", str(noted.get(slug, "")) == "f:320")
+	var chain_rows: Array = [
+		Ark.card_row({"identifier": channel, "title": title, "collections": []}),
+		Ark.file_row(channel, 0, {"name": "talk.mp4", "size": "4", "source": "original"}, "abc", 1),
+		Ark.blob_row(0, 0, 1, "abc", 1, "QQ=="),
+	]
+	var from_chain := Ark.grouping_files(chain_rows, 320)
+	_check(
+		"a grouping fraction does not need the archive",
+		bool(from_chain.get("known", false))
+		and int(from_chain.get("aboard", 0)) == 1
+		and int(from_chain.get("total", 0)) == 320
+	)
+	var from_names := Ark.grouping_files(
+		chain_rows,
+		0,
+		PackedStringArray(["talk.mp4", "other.mp4"])
+	)
+	_check(
+		"named originals still set the file fraction",
+		int(from_names.get("aboard", 0)) == 1 and int(from_names.get("total", 0)) == 2
+	)
+	var no_size := Ark.grouping_files([], 0)
+	_check("a grouping without a denominator stays unknown", not bool(no_size.get("known", true)))
+	var names := PackedStringArray(["talk.mp4", "talk.en.vtt"])
+	var tally := Ark.file_tally(
+		[
+			Ark.card_row({"identifier": channel, "title": title, "collections": []}),
+			Ark.file_row(channel, 0, {"name": "talk.mp4", "size": "4", "source": "original"}, "abc", 1),
+			Ark.blob_row(0, 0, 1, "abc", 1, "QQ=="),
+		],
+		names
+	)
+	_check(
+		"one original of two is aboard",
+		int(tally.get("aboard", 0)) == 1
+		and int(tally.get("total", 0)) == 2
+		and not bool(tally.get("complete", true))
+	)
+
+
+func _view(views: Array, slug: String) -> Dictionary:
+	for view in views:
+		if str((view as Dictionary).get("slug", "")) == slug:
+			return view
+	return {}
+
+
 func _cache() -> void:
 	var cache := ArkCache.new("user://ark_selftest_cache")
 	cache.clear_all()
@@ -397,6 +662,7 @@ func _aboard() -> void:
 		},
 		{"id": "three", "identifier": "three", "title": "Three", "collections": "prelinger", "bytes": "3"},
 		{"id": "four", "identifier": "four", "title": "Four", "collections": "", "bytes": "4"},
+		{"id": "five", "identifier": "five", "title": "Five", "collections": "nasa", "bytes": "5"},
 	]
 	var kinds: Array = [
 		Ark.kind_header_row("alpha", "Alpha", "", ""),
@@ -422,10 +688,12 @@ func _aboard() -> void:
 	_check("a bound collection shares the kind heading", _ids(beta) == PackedStringArray(["one", "three"]))
 	_check("no second heading is opened for that collection", _group(groups, "prelinger").is_empty())
 	_check("an empty kind stays on the wall", (_group(groups, "Gamma").get("items", [1]) as Array).is_empty())
-	var nasa := _group(groups, "nasa")
-	_check("the other collection keeps its own heading", _ids(nasa) == PackedStringArray(["one"]))
+	_check("an unbound collection does not open a heading", _group(groups, "nasa").is_empty())
 	_check("unfiled is last", str((groups[groups.size() - 1] as Dictionary).get("heading", "")) == "UNFILED")
-	_check("an ungrouped item is unfiled", _ids(groups[groups.size() - 1]) == PackedStringArray(["four"]))
+	_check(
+		"an ungrouped item is unfiled",
+		_ids(groups[groups.size() - 1]) == PackedStringArray(["four", "five"])
+	)
 	var by_heading := Ark.aboard_filter(groups, "gamma")
 	_check(
 		"a heading filter keeps an empty kind",
@@ -453,6 +721,15 @@ func _kinds() -> void:
 	var page_items: PackedStringArray = page.get("items", PackedStringArray())
 	_check("a scrape page lists the identifiers", bool(page.get("ok", false)) and page_items.size() == 2)
 	_check("a scrape page keeps the cursor", str(page.get("cursor", "")) == "next" and not bool(page.get("finished", true)))
+	_check(
+		"a scrape page publishes the collection size",
+		int(page.get("total", 0)) == 10 and bool(page.get("total_known", false))
+	)
+	var bare_page := Archive.parse_scrape('{"items":[{"identifier":"a"}],"cursor":null}')
+	_check(
+		"a scrape without a total does not invent a collection size",
+		bool(bare_page.get("ok", false)) and not bool(bare_page.get("total_known", true))
+	)
 	var last := Archive.parse_scrape('{"items":[{"identifier":"c"}],"cursor":null,"total":3}')
 	_check("a null cursor finishes the walk", bool(last.get("ok", false)) and bool(last.get("finished", false)))
 	_check("a broken scrape is not a page", not bool(Archive.parse_scrape("{").get("ok", true)))
@@ -461,6 +738,9 @@ func _kinds() -> void:
 		Ark.file_row("ark", 0, {"name": "note.txt", "size": "1", "source": "original"}, "abc", 1),
 		Ark.blob_row(0, 0, 1, "abc", 1, "QQ=="),
 	]
+	var finished := Ark.complete_file_names(rows)
+	_check("complete names are the finished files", finished == PackedStringArray(["note.txt"]))
+	_check("a missing blob is not a complete name", Ark.complete_file_names(rows.slice(0, 2)).is_empty())
 	var whole := Ark.file_tally(rows, PackedStringArray(["note.txt"]))
 	_check("a file with its blob is complete", bool(whole.get("complete", false)) and int(whole.get("aboard", 0)) == 1)
 	var gap := Ark.file_tally(rows.slice(0, 2), PackedStringArray(["note.txt"]))
@@ -612,8 +892,25 @@ func _chain_writes() -> void:
 	_check("one byte is one part", str(header.get("parts", "")) == "1")
 	space.fail_on = ""
 	var before := space.writes.size()
-	var second: bool = await cabinet.inscribe(item, files, paths, Callable())
+	var seen: Array = []
+	var second: bool = await cabinet.inscribe(
+		item,
+		files,
+		paths,
+		Callable(),
+		[],
+		func(p: float) -> void: seen.append(p)
+	)
 	_check("second pass finishes", second)
+	var moved := false
+	for reported in seen:
+		var value := float(reported)
+		if value > 50.0 and value < 100.0:
+			moved = true
+	_check(
+		"inscription progress advances past the first write",
+		seen.size() > 1 and is_equal_approx(float(seen[seen.size() - 1]), 100.0) and moved
+	)
 	_check("blob landed", space.has_id(table, "b:0:0"))
 	_check("manifest landed", space.has_id("manifest", "ark"))
 	var resumed: Array = space.writes.slice(before)
@@ -634,6 +931,7 @@ func _chain_writes() -> void:
 		"file list keeps the chain sha",
 		str((listed[0] as Dictionary).get("sha256", "")) == expect_sha
 	)
+	_check("file list marks a complete file aboard", bool((listed[0] as Dictionary).get("aboard", false)))
 	var back := "user://ark_selftest_back.txt"
 	var got: Dictionary = await cabinet.reassemble("ark", "note.txt", back)
 	_check(
@@ -667,6 +965,11 @@ func _chain_writes() -> void:
 	var gapped: Dictionary = await cabinet.reassemble("split", "clip.mp4", clip)
 	_check("a missing part is refused", not bool(gapped.get("ok", false)))
 	_check("a missing part deletes the partial", not FileAccess.file_exists(clip))
+	var partial_list: Array = await cabinet.file_list("split")
+	_check(
+		"file list does not mark a partial file aboard",
+		partial_list.size() == 1 and not bool((partial_list[0] as Dictionary).get("aboard", true))
+	)
 	var orphan_name := Ark.table_name("orphan")
 	space.tables[orphan_name] = [Ark.card_row({
 		"identifier": "orphan",
@@ -770,6 +1073,9 @@ class FakeSpace:
 			return null
 		(tables[name] as Array).append(row)
 		writes.append(id)
+		if _progress.is_valid():
+			_progress.call(40.0)
+			_progress.call(100.0)
 		return {"ok": true}
 
 	func table_names() -> PackedStringArray:
